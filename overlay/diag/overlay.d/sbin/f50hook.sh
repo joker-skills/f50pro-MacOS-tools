@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# f50pro-tools boot hook (root, from Magisk overlay.d):
+# f50pro-MacOS-tools boot hook (root, from Magisk overlay.d):
 #  1. grant Magisk su to the adb shell uid (2000) so `adb shell su` works without the Magisk app UI
 #  2. run /data/local/tmp/f50hook.sh if present (iterate diagnostics without reflashing init_boot)
 LOG=/data/local/tmp/f50hook.log

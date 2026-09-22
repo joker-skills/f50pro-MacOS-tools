@@ -1,8 +1,16 @@
-# f50pro-tools
+# f50pro-MacOS-tools
 
-中兴 **F50 Pro**（型号 MU3356，展锐 UMS9620 平台，Android 15）5G 随身 WiFi 在 **macOS 上 USB 直连每 3 秒重新枚举、无法当网卡** 的根因分析、修复脚本，以及在 Apple Silicon Mac 上用 `spd_dump` 备份 / 刷 Root 包的完整工具链。
+在 **macOS 上配置和维护中兴 F50 Pro**（型号 MU3356，展锐 UMS9620，Android 15）5G 随身 WiFi 的工具集。它从解决一个具体问题起步：**F50 Pro 用 USB 直连 Mac 时每 3 秒重新枚举一次、始终无法作为网卡使用**。围绕这个问题，仓库记录了在 Apple Silicon Mac 上从零开始的全部必要步骤——编译免驱的 `spd_dump`、只读全量备份、核对并刷入社区 Root 包、拿到 root 级 ADB、定位真因、下发修复——以及每一步踩到的坑。
 
-> **TL;DR (English)** — Plugged into a Mac, the ZTE F50 Pro re-enumerates every ~3 s and never gets a DHCP lease. The trigger is **WeChat for Mac**: it sends Android Open Accessory (AOA) probes (`GETPROTOCOL → SENDSTRING → START`, identifying itself as `WeChat / WeChatUSB`) to every new Android-looking USB device. The headless F50 Pro obeys, switches to accessory mode (`18d1:2d00`), nobody claims the accessory, it falls back to `ncm,mtp`, re-enumerates, and WeChat probes again. Any host software that speaks AOA (Android Auto tools, phone managers, …) can do the same. **Fix:** with root, a Magisk `post-fs-data.d` script bind-mounts an empty permissions XML over `/vendor/etc/permissions/android.hardware.usb.accessory.xml`; `UsbDeviceManager.startAccessoryMode()` then returns early and the gadget stays in NCM mode. Without root, quit WeChat while the device is attached. This repo also documents a driver-free, Apple Silicon `spd_dump` workflow (full partition backup, root package audit, guardrailed flashing, init_boot repacking that keeps the AVB footer).
+> **TL;DR (English)** — Plugged into a Mac, the ZTE F50 Pro re-enumerates every ~3 s and never gets a DHCP lease. The trigger is **WeChat for Mac**: it sends Android Open Accessory (AOA) probes (`GETPROTOCOL → SENDSTRING → START`, identifying itself as `WeChat / WeChatUSB`) to every new Android-looking USB device. The headless F50 Pro obeys, switches to accessory mode (`18d1:2d00`), nobody claims the accessory, it falls back to `ncm,mtp`, re-enumerates, and WeChat probes again. Any host software that speaks AOA can do the same. **Fix:** with root, a Magisk `post-fs-data.d` script bind-mounts an empty permissions XML over `/vendor/etc/permissions/android.hardware.usb.accessory.xml`; `UsbDeviceManager.startAccessoryMode()` then returns early and the gadget stays in NCM mode. Without root, quit WeChat while the device is attached. The repo also documents a driver-free Apple Silicon `spd_dump` workflow: full partition backup, root-package audit, guardrailed flashing, and init_boot repacking that keeps the AVB footer.
+
+**从零开始请直接看 [docs/getting-started.md](docs/getting-started.md)。**
+
+## 定位与路线图
+
+- 现在：一组 shell / Python 脚本加文档，覆盖「USB 直连不稳」这一个问题的诊断与修复，以及支撑它的 Root 流程。
+- 目标：一个面向 F50 Pro 的 macOS 配置工具，模块化地覆盖备份 / 恢复、Root 与无线 ADB 管理、管理页参数（USB 协议、性能模式等）的读写、USB 与网络状态监视、常见故障的一键诊断。它会作为一个独立模块被作者的其它工具集成，但本仓库始终保持自包含，不依赖那些工具。
+- 不做的事：不分发固件、Root 包或任何第三方二进制；不做解锁 Bootloader、改 IMEI 一类的操作。
 
 ## 现象
 
@@ -46,9 +54,10 @@ Android 收到 AOA `START` 后由 `UsbDeviceManager` 切到 `accessory` 配置�
 | `overlay/diag/` | 诊断用 overlay：开机打开 `adb_enabled`、重启 adbd、收集 USB/ADB 诊断并镜像进 `sd_klog` 分区；`f50hook.sh` 给 uid 2000 写 Magisk 放行策略。 |
 | `device/f50-no-aoa.sh` | **修复脚本**（Magisk post-fs-data.d）。 |
 | `device/f50mon.sh` | 设备侧 USB gadget 状态监视（Magisk service.d），按启动 ID 分文件记录。 |
-| `docs/` | 排查过程、Mac 刷机指南、USB ID 表、参考资料、B25 分区表。 |
+| `docs/getting-started.md` | 从零开始：依赖、编译、备份、Root、拿 ADB、下发修复、回退。 |
+| `docs/` 其它 | 排查过程（investigation）、Mac 刷机原理与坑（flashing-macos）、USB ID 表、参考资料、B25 分区表。 |
 
-## 快速开始（有 Mac、想 Root 并修复）
+## 快速开始（摘要，完整步骤见 docs/getting-started.md）
 
 前提：设备固件版本与社区 Root 包版本一致（本例 B25），`brew install libusb lz4`，Android platform-tools。
 

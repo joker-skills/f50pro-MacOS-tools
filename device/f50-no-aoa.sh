@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# f50pro-tools (Magisk post-fs-data.d): hide the android.hardware.usb.accessory system feature.
+# f50pro-MacOS-tools (Magisk post-fs-data.d): hide the android.hardware.usb.accessory system feature.
 # UsbDeviceManager.startAccessoryMode() returns immediately when the feature is absent, so AOA probes
 # from hosts (Mac WeChat sends GETPROTOCOL/SENDSTRING/START to every new Android-looking USB device)
 # no longer switch the gadget into accessory mode. That switch was the 3 s re-enumeration loop.

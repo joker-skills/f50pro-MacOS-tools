@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# f50pro-tools: enable ADB the way Android expects (adb_enabled setting), restart adbd on tcp:5555,
+# f50pro-MacOS-tools: enable ADB the way Android expects (adb_enabled setting), restart adbd on tcp:5555,
 # dump USB/ADB diagnostics to /data/local/tmp/f50diag.txt and mirror them into the sd_klog partition
 # for offline readback via spd_dump. Runs once per boot from Magisk overlay.d.
 LOG=/data/local/tmp/f50diag.txt

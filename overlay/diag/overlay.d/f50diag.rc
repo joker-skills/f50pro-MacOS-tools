@@ -1,4 +1,4 @@
-## f50pro-tools: diagnostics + adb enable + boot hook, injected via Magisk overlay.d
+## f50pro-MacOS-tools: diagnostics + adb enable + boot hook, injected via Magisk overlay.d
 # Use ${MAGISKTMP} to reference Magisk tmpfs folder
 
 on late-start
