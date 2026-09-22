@@ -1,0 +1,14 @@
+build/
+vendor/
+backups/
+pkg/
+local/
+partition_*.xml
+sprdpart.bin
+*.bin
+*.img
+*.pac
+*.zip
+*.7z
+.DS_Store
+__pycache__/

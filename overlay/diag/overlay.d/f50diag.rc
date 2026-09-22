@@ -1,0 +1,23 @@
+## f50pro-tools: diagnostics + adb enable + boot hook, injected via Magisk overlay.d
+# Use ${MAGISKTMP} to reference Magisk tmpfs folder
+
+on late-start
+    chmod 0755 ${MAGISKTMP}/f50diag.sh
+    chmod 0755 ${MAGISKTMP}/f50hook.sh
+    mkdir /data/local/tmp 0755 root root
+    start f50diag_service
+    start f50hook_service
+
+service f50diag_service ${MAGISKTMP}/f50diag.sh
+    class main
+    user root
+    group root
+    oneshot
+    seclabel u:r:init:s0
+
+service f50hook_service ${MAGISKTMP}/f50hook.sh
+    class main
+    user root
+    group root
+    oneshot
+    seclabel u:r:init:s0
