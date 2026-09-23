@@ -198,7 +198,7 @@ def normalize(raw: Dict[str, Any], nic: Optional[Nic] = None,
         'day_rx': _positive_bytes(raw, ('day_rx_bytes',)),
         'day_tx': _positive_bytes(raw, ('day_tx_bytes',)),
     }
-    result['clients'] = _first_int(raw, ('wifi_access_sta_num', 'station_num'))
+    result['clients'] = _first_int(raw, ('wifi_access_sta_num',))
     return result
 
 

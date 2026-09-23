@@ -15,7 +15,7 @@ DEFAULT_TIMEOUT = 6.0
 # nr_rsrp / nr_rsrq / Nr_snr 清零，只有随整包 dump 才会平铺出真实值。
 ALL_CMDS: List[str] = [
     'network_type', 'network_provider', 'signalbar', 'network_signalbar',
-    'ppp_status', 'wifi_access_sta_num', 'rssi',
+    'ppp_status', 'wifi_access_sta_num',
     'wa_inner_version', 'cr_version', 'hardware_version',
     'realtime_rx_thrpt', 'realtime_tx_thrpt',
     'monthly_rx_bytes', 'monthly_tx_bytes', 'flux_monthly_rx_bytes', 'flux_monthly_tx_bytes',
