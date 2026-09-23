@@ -26,7 +26,7 @@ _RESET_KEYS = ('flux_clear_date', 'data_volume_clear_date', 'traffic_clear_date'
                'monthly_clear_day', 'data_volume_reset_day', 'reset_day', 'billing_day')
 _MONTHLY_RX_KEYS = ('monthly_rx_bytes', 'flux_monthly_rx_bytes')
 _MONTHLY_TX_KEYS = ('monthly_tx_bytes', 'flux_monthly_tx_bytes')
-_SIGNALBAR_KEYS = ('signalbar', 'network_signalbar', 'rssi')
+_SIGNALBAR_KEYS = ('signalbar', 'network_signalbar')
 
 
 def _clean(value: Any) -> Optional[str]:

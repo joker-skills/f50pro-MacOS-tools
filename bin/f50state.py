@@ -95,6 +95,8 @@ def main(argv=None):
     parser.add_argument('--watch', type=float, metavar='SECONDS', help='循环刷新间隔')
     parser.add_argument('--version', action='version', version='f50pro ' + __version__)
     args = parser.parse_args(argv)
+    if args.watch is not None and args.watch <= 0:
+        parser.error('--watch 必须是正数秒数')
 
     if args.watch:
         try:

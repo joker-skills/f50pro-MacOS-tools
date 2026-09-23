@@ -57,7 +57,7 @@ python3 bin/f50state.py --host http://192.168.0.1 --iface en13
 |---|---|---|
 | `network.type` | `network_type` | 如 `5G`；部分固件回数字（20/19/10/11） |
 | `network.provider` | `network_provider` | 运营商名 |
-| `network.signalbar` | `signalbar` / `network_signalbar` / `rssi` | 0-5 信号格 |
+| `network.signalbar` | `signalbar` / `network_signalbar` | 0-5 信号格（不用 `rssi`：它是 dBm，量纲不同） |
 | `network.rsrp` / `rsrq` / `snr` | `nr_rsrp` / `nr_rsrq` / `Nr_snr`（来自 `network_information` dump） | NR 优先，缺失回退 LTE 键 |
 | `network.bands` | `Nr_bands` / `nr5g_action_band` / `lte_band` / `wan_active_band` | 归一为 `B3 + n78` 形式 |
 | `network.pci` / `cell_id` / `tac` | `Nr_pci` / `Nr_cell_id` / `nr_tac` | 小区标识 |
