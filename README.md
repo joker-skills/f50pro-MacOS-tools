@@ -8,7 +8,7 @@
 
 ## 定位与路线图
 
-- 现在：一组 shell / Python 脚本加文档，覆盖「USB 直连不稳」这一个问题的诊断与修复，以及支撑它的 Root 流程。
+- 现在：一组 shell / Python 脚本加文档，覆盖「USB 直连不稳」这一个问题的诊断与修复、支撑它的 Root 流程，以及只读状态监视（`bin/f50state.py` 与 `f50pro` 包，见 [docs/status.md](docs/status.md)）。
 - 目标：一个面向 F50 Pro 的 macOS 配置工具，模块化地覆盖备份 / 恢复、Root 与无线 ADB 管理、管理页参数（USB 协议、性能模式等）的读写、USB 与网络状态监视、常见故障的一键诊断。它会作为一个独立模块被作者的其它工具集成，但本仓库始终保持自包含，不依赖那些工具。
 - 不做的事：不分发固件、Root 包或任何第三方二进制；不做解锁 Bootloader、改 IMEI 一类的操作。
 
@@ -45,6 +45,10 @@ Android 收到 AOA `START` 后由 `UsbDeviceManager` 切到 `accessory` 配置�
 | `bin/build-spd_dump.sh` | 在 Apple Silicon 上从 [TomKing062/spreadtrum_flash](https://github.com/TomKing062/spreadtrum_flash) 编译 `spd_dump`（libusb，免驱、勿 sudo）。 |
 | `bin/usb-state.py` | 用 `ioreg` 判定设备当前 USB 身份；`--watch N` 观察变化；`--absent-for N` 作「已拔线」联锁。 |
 | `bin/mac-usb-sample.sh` | Mac 侧采样：出现过哪些 VID:PID、哪些进程持有设备。 |
+| `bin/f50state.py` | 只读状态：网络制式 / 运营商 / 信号 / 频段 / 设备侧月流量与账单日；`--json` 输出稳定契约供集成。 |
+| `f50pro/` | 状态工具的库实现：网卡发现、goform 只读客户端、字段归一、格式化。 |
+| `tests/` | 纯标准库单元测试：`python3 -m unittest discover -s tests -t .`。 |
+| `docs/status.md` | 只读状态工具的设计、JSON 契约、字段来源与隐私说明。 |
 | `bin/backup.sh` | 只读全量备份（`--kickto 2` 冷上电抓 boot_diag，`r all`），按设备分区表校验完整性。 |
 | `bin/read-part.sh` | 只读读取指定分区。 |
 | `bin/flash-root.sh` | 刷社区 Root 包（`trustos` + `init_boot`，活动槽），带哈希 / 指纹 / 备份完整性 / 拔线联锁 / `DRY_RUN` 预检。 |
