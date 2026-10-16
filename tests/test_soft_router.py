@@ -128,6 +128,8 @@ sys.exit(rc)
             lines = (root / "commands").read_text().splitlines()
             for name in ("iptables", "ip6tables"):
                 rules = [line for line in lines if line.startswith(name) and " -A F50SR_TP " in line]
+                if name == "ip6tables":
+                    self.assertIn("-d fe80::/10 -j RETURN", rules.pop(0))
                 self.assertTrue(all("--dport 53" in line for line in rules[:2]))
                 self.assertTrue(any("-p tcp -j TPROXY" in line for line in rules))
                 self.assertTrue(any("-p udp -j TPROXY" in line for line in rules))
@@ -263,6 +265,25 @@ class LifecycleTest(unittest.TestCase):
                 contextlib.redirect_stdout(output):
             self.assertEqual(host.main(), 0)
         self.assertIn('"BackendState": "NeedsLogin"', output.getvalue())
+
+    def test_startup_wait_reads_until_running_without_restarting(self):
+        from unittest.mock import Mock
+        device = SimpleNamespace(shell=Mock(side_effect=[
+            SimpleNamespace(stdout=b'{"BackendState":"Starting"}'),
+            SimpleNamespace(stdout=b'{"BackendState":"Running"}')]))
+        with patch.object(host.time, "sleep") as sleep:
+            self.assertEqual(host.tailscale_status(device, wait=True)["BackendState"], "Running")
+            sleep.assert_called_once_with(1)
+        self.assertEqual(device.shell.call_count, 2)
+        self.assertTrue(all(" status --json" in call.args[0] for call in device.shell.call_args_list))
+
+    def test_startup_wait_is_bounded(self):
+        from unittest.mock import Mock
+        device = SimpleNamespace(shell=Mock(return_value=SimpleNamespace(stdout=b'{"BackendState":"Starting"}')))
+        with patch.object(host.time, "sleep") as sleep, self.assertRaises(host.OperationError):
+            host.tailscale_status(device, wait=True)
+        self.assertEqual(device.shell.call_count, 20)
+        self.assertEqual(sleep.call_count, 19)
 
     def test_errors_only_expose_our_safe_diagnostics(self):
         for error, expected in [(host.OperationError("Asset mismatch"), "Asset mismatch"),

@@ -51,6 +51,10 @@ prepare)
         xt=iptables; loopback=127.0.0.1
         [ "$family" = 4 ] || { xt=ip6tables; loopback=::1; }
         "$xt" -w 5 -t mangle -N F50SR_TP
+        # v1.19.32 loses link-local scope on UDP replies; preserve stock LAN DNS.
+        if [ "$family" = 6 ]; then
+            "$xt" -w 5 -t mangle -A F50SR_TP -d fe80::/10 -j RETURN
+        fi
         # DNS precedes private/local bypass: clients normally query the router.
         for proto in tcp udp; do
             "$xt" -w 5 -t mangle -A F50SR_TP -p "$proto" --dport 53 -j TPROXY --on-ip "$loopback" --on-port 17891 --tproxy-mark "$MARK"

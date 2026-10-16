@@ -18,6 +18,7 @@ apply 可选 `--transparent --autostart`；其它命令从部署记录读取真�
 - `apply`：校验仓内固定二进制摘要，保存停止态 baseline，写入配置并启动。
   assets-dir 包含解压后的 mihomo、tailscale、tailscaled，不接受未知摘要。
   private-config 是 JSON，只取当前已授权的测试节点；不保存到 Git。
+  Tailscale 启动遇到 Starting/NoState 时只读轮询最多 20 次、间隔 1 秒，不重启或重置身份。
 - `check`：0 表示本次版本进程与摘要一致；10 表示未运行；20 表示未知或不健康。
   透明模式还检查本模块的双栈规则和 hook，自启模式校验自启文件。
   **这不代替真实 USB/热点客户端的 DNS、IPv4/IPv6 HTTPS 和 UDP 业务探针。**
@@ -40,9 +41,13 @@ PID 被无关进程复用时不会向它发信号；最终仍通过进程扫描�
   路由仅增加 `pref 1789 iif br0 fwmark 0x80000000/0x80000000 lookup 17891`，
   对应表内 `local default dev lo`。该 mark 位不是系统全局独占，必须保留 iif 条件。
 - Mihomo 两个 TPROXY listener 只绑定 `127.0.0.1:17891`、`[::1]:17891`。
-  TCP/UDP 53 在 LAN 绕过前交给内部 `type: dns` 出站；没有额外公开 DNS 端口，
+  IPv4 和非链路本地 IPv6 的 TCP/UDP 53 在 LAN 绕过前交给内部 `type: dns` 出站；没有额外公开 DNS 端口，
   不依赖设备缺失的 IPv6 NAT 或 addrtype。DoH 经代理，节点域名 bootstrap DNS 直连。
   AAAA 保留，使用 redir-host，不依赖跨重启的 fake-IP 映射。
+- IPv6 链路本地（`fe80::/10`）包括路由器通告的 DNS，保留固件原生解析直连，
+  不是全 DNS 隐私隧道。Mihomo v1.19.32 的 UDP TPROXY 回复会丢失链路本地区域标识，
+  B25 实测对该地址的 DNS 回包报 invalid argument；不修改上游源码，改为提前绕过。
+  验收必须同时确认原生链路本地 DNS 可用、公共 IPv6 DNS 经过透明链以及真实 IPv6 HTTPS。
 - 管理地址、LAN 前缀、私网、链路本地、组播非 DNS 流量绕过；ICMP/ICMPv6 不截获。
   地址/前缀在启动时采样，运营商重新分配 LAN IPv6 前缀后需停止并重新部署以更新绕过。
   代理节点必须支持 UDP 和所需的 IPv6 目标；配置成功不能代替实测。

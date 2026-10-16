@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = "/data/adb/f50-soft-router"
 BOOT = "/data/adb/service.d/f50-soft-router.sh"
@@ -134,6 +135,7 @@ def apply(args, device):
     if result.returncode:
         device.service("stop")
         raise OperationError("Start incomplete; use check then restore, do not replay apply")
+    tailscale_status(device, wait=True)
     if autostart:
         device.require(f"set -e; [ -d {str(Path(BOOT).parent)} ]; [ ! -e {BOOT} ]; umask 077; "
                        f"cp {ROOT}/boot.sh {ROOT}/boot.install; chmod 700 {ROOT}/boot.install; "
@@ -195,13 +197,17 @@ def recover_partial(device, record):
     device.require(f"rmdir {ROOT}")
 
 
-def tailscale_status(device):
-    response = device.shell(f"{ROOT}/tailscale --socket={ROOT}/tailscaled.sock status --json")
-    status = json.loads(response.stdout)
-    if not isinstance(status, dict) or status.get("BackendState") not in {
-            "NeedsLogin", "Running", "NeedsMachineAuth", "Stopped"}:
-        raise OperationError("Tailscale returned no recognized backend state")
-    return status
+def tailscale_status(device, wait=False):
+    for attempt in range(20 if wait else 1):
+        response = device.shell(f"{ROOT}/tailscale --socket={ROOT}/tailscaled.sock status --json")
+        status = json.loads(response.stdout)
+        state = status.get("BackendState") if isinstance(status, dict) else None
+        if state in {"NeedsLogin", "Running", "NeedsMachineAuth", "Stopped"}:
+            return status
+        if wait and state in {"Starting", "NoState"} and attempt < 19:
+            time.sleep(1)
+            continue
+        raise OperationError("Tailscale has not reached a recognized ready state; inspect ts-status")
 
 
 def main():
