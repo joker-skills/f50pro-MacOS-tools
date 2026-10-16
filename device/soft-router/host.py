@@ -85,7 +85,7 @@ def apply(args, device):
         raise ValueError("State directory already used; check or restore before a new trial")
     exists = device.require(f"if [ -e {ROOT} ]; then echo exists; else echo absent; fi").strip()
     if exists == b"exists":
-        device.require(f"[ ! -L {ROOT} ] && [ \"$(cat {ROOT}/owner)\" = f50-soft-router-v1")
+        device.require(f"[ ! -L {ROOT} ] && [ \"$(cat {ROOT}/owner)\" = f50-soft-router-v1 ]")
         if device.service("check").returncode != 10:
             raise ValueError("Existing deployment is not verifiably stopped")
     elif exists != b"absent":

@@ -13,6 +13,19 @@ host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
 
 
+class LocalShellDevice(host.Device):
+    def shell(self, script, *, data=None):
+        # macOS has shasum; directory guards and writes execute unchanged.
+        script = script.replace("sha256sum ", "shasum -a 256 ")
+        return subprocess.run(["sh", "-c", script], input=data, capture_output=True)
+
+    def service(self, action):
+        # Only Android process execution is replaced, by a controlled shell service.
+        commands = {"start": "touch active", "stop": "rm -f active",
+                    "check": "if [ -e active ]; then exit 0; else exit 10; fi"}
+        return self.shell(f"cd {host.ROOT} && " + commands[action])
+
+
 class ExplicitConfigTest(unittest.TestCase):
     def config(self, extra):
         with tempfile.TemporaryDirectory() as directory:
@@ -42,6 +55,33 @@ class ExplicitConfigTest(unittest.TestCase):
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_apply_restore_reapply_real_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            assets = base / "assets"
+            assets.mkdir()
+            for name in ("mihomo", "tailscaled", "tailscale"):
+                body = 'echo \'{"BackendState":"NeedsLogin"}\'\n' if name == "tailscale" else "exit 0\n"
+                (assets / name).write_text("#!/bin/sh\n" + body)
+            (assets / "artifacts.json").write_text(json.dumps({"sha256": {
+                name: host.digest(assets / name) for name in ("mihomo", "tailscale", "tailscaled")}}))
+            (assets / "service.sh").write_bytes((MODULE.parent / "service.sh").read_bytes())
+            private = base / "private.json"
+            private.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"]}))
+            args = SimpleNamespace(serial="fake", source_oid="a" * 40,
+                assets_dir=str(assets), private_config=str(private), state_dir=str(base / "trial1"))
+            device = LocalShellDevice("fake")
+            with patch.object(host, "ROOT", str(base / "device")), patch.object(host, "HERE", assets):
+                self.assertEqual(host.apply(args, device), 0)
+                argv = ["host.py", "restore", "--serial", "fake", "--source-oid", args.source_oid,
+                        "--state-dir", args.state_dir]
+                with patch.object(host.sys, "argv", argv), patch.object(host, "Device", return_value=device):
+                    self.assertEqual(host.main(), 0)
+                self.assertEqual(host.check(args, device), 10)
+                args.state_dir = str(base / "trial2")
+                self.assertEqual(host.apply(args, device), 0)
+                self.assertTrue(json.loads((base / "trial2/deployment.json").read_text())["directory_existed"])
+
     def fake_service(self, root, action):
         script = (MODULE.parent / "service.sh").read_text()
         script = script.replace("ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
