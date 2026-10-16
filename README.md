@@ -47,7 +47,7 @@ Android 收到 AOA `START` 后由 `UsbDeviceManager` 切到 `accessory` 配置�
 | `bin/mac-usb-sample.sh` | Mac 侧采样：出现过哪些 VID:PID、哪些进程持有设备。 |
 | `bin/f50state.py` | 只读状态：网络制式 / 运营商 / 信号 / 频段 / 设备侧月流量与账单日；`--json` 输出稳定契约供集成。 |
 | `f50pro/` | 状态工具的库实现：网卡发现、goform 只读客户端、字段归一、格式化。 |
-| `tests/` | 纯标准库单元测试：`python3 -m unittest discover -s tests -t .`。 |
+| `tests/` | 单元测试（中心 Mihomo YAML 适配测试需宿主 PyYAML）：`python3 -m unittest discover -s tests -t .`。 |
 | `docs/status.md` | 只读状态工具的设计、JSON 契约、字段来源与隐私说明。 |
 | `bin/backup.sh` | 只读全量备份（`--kickto 2` 冷上电抓 boot_diag，`r all`），按设备分区表校验完整性。 |
 | `bin/read-part.sh` | 只读读取指定分区。 |
@@ -56,6 +56,7 @@ Android 收到 AOA `START` 后由 `UsbDeviceManager` 切到 `accessory` 配置�
 | `bin/restore.sh` | 用备份把活动槽的 `trustos` / `init_boot` 写回。 |
 | `bin/repack-init-boot.py` | 往 Magisk 修补过的 `init_boot`（header v4，lz4 legacy ramdisk）里追加 `overlay.d` 文件，保留并按需搬移 AVB vbmeta / footer。 |
 | `overlay/diag/` | 诊断用 overlay：开机打开 `adb_enabled`、重启 adbd、收集 USB/ADB 诊断并镜像进 `sd_klog` 分区；`f50hook.sh` 给 uid 2000 写 Magisk 放行策略。 |
+| `device/soft-router/` | [复用中心 Mihomo 配置的双栈透明代理与 userspace Tailscale](device/soft-router/README.md)，保留 B25，不另维护分流规则。 |
 | `device/f50-no-aoa.sh` | **修复脚本**（Magisk post-fs-data.d）。 |
 | `device/f50mon.sh` | 设备侧 USB gadget 状态监视（Magisk service.d），按启动 ID 分文件记录。 |
 | `docs/getting-started.md` | 从零开始：依赖、编译、备份、Root、拿 ADB、下发修复、回退。 |
