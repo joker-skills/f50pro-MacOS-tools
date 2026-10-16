@@ -34,3 +34,14 @@ apply 需要全部参数；restore/restore-check 需要 source-oid 和 state-dir
 二进制来自官方 MetaCubeX/mihomo Android arm64 与 Tailscale Linux arm64 release；
 版本和摘要见 artifacts.json。上游许可随其官方发布适用；本仓不分发二进制。
 Tailscale 登录、真实代理出口、断线重连及重启持久性必须在设备上验证，不能由单测替代。
+
+## B25 的双频 Wi-Fi 边界
+
+2026-10-16 实机只读检查：`cmd wifi get-softap-supported-features` 只返回
+`wifi_softap_acs_supported`、`wifi_softap_wpa3_sae_supported`，没有
+`wifi_softap_bridged_ap_supported`；`config_wifiBridgedSoftApSupported=false`。
+HAL 的 AP 模式只有 `maxIfaces=1 types=[1]`，没有 AP_BRIDGED 并发组合。
+
+因此当前 B25 固件/驱动没有提供 2.4 GHz + 5 GHz 同时 AP，不能只修改 UI 开启。
+这些结果不能确定硬件本身的绝对能力。保持 B25、不刷机，也不尝试强制开启或修改无线配置。
+相关机制见 [Android AP/AP 并发说明](https://source.android.com/docs/core/connect/wifi-ap-ap-concurrency)。
