@@ -5,7 +5,7 @@ count=0
 while [ -f "$ROOT/boot-enabled" ] && [ "$count" -lt 180 ]; do
     if [ "$(/system/bin/getprop sys.boot_completed)" = 1 ] &&
        /system/bin/ip -4 addr show dev br0 | grep -q 'inet 192.168.0.1/' &&
-       /system/bin/ip -4 addr show dev sipa_eth8 | grep -q 'inet '; then
+       /data/adb/magisk/busybox ash "$ROOT/service.sh" uplink >/dev/null 2>&1; then
         /data/adb/magisk/busybox ash "$ROOT/service.sh" boot >> "$ROOT/boot.log" 2>&1
         result=$?
         [ "$result" = 0 ] && exit 0

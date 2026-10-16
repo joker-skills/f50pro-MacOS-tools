@@ -49,7 +49,7 @@ class ExplicitConfigTest(unittest.TestCase):
         self.assertFalse(cfg["tun"]["enable"])
         self.assertFalse(cfg["dns"]["enable"])
         self.assertEqual(cfg["mixed-port"], 17890)
-        self.assertEqual(cfg["interface-name"], "sipa_eth8")
+        self.assertEqual(cfg["interface-name"], "__F50_CELLULAR_INTERFACE__")
 
     def test_removes_source_ingress_and_controller(self):
         extra = {key: "source-setting" for key in ("port", "socks-port", "redir-port", "tproxy-port",
@@ -256,6 +256,149 @@ sys.exit(rc)
             self.assertTrue(all(value == [] for value in state.values()))
 
 
+class CellularInterfaceTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        for name, content in {"owner": "f50-soft-router-v1\n", "mode": "explicit\n",
+                              "routes": "", "addresses": ""}.items():
+            (self.root / name).write_text(content)
+        self.script = (MODULE.parent / "service.sh").read_text().replace(
+            "ROOT=/data/adb/f50-soft-router", f"ROOT={self.root}")
+        self.script = self.script.replace("/proc/", f"{self.root}/proc/")
+        self.script = self.script.replace("/system/bin/ip", str(self.root / "ip"))
+        self.script = self.script.replace("/data/adb/magisk/busybox flock -n 9", "true")
+        self.script = self.script.replace("sha256sum", "shasum -a 256")
+        self.tool("ip", f'''[ ! -e "{self.root}/ip-fails" ] || exit 1
+case "$*" in
+    '-4 route show table all') cat "{self.root}/routes";;
+    '-4 addr show') cat "{self.root}/addresses";;
+    *) exit 99;;
+esac
+''')
+        self.tool("mihomo", f'''printf '%s\\n' "$*" >> "{self.root}/preflight"
+exit 1
+''')
+        private = self.root / "private.json"
+        private.write_text(json.dumps({"proxies": [{"name": "🚀 节点",
+            "interface-name": "__F50_CELLULAR_INTERFACE__"}], "rules": ["MATCH,🚀 节点"]}))
+        self.config = host.configuration(private)
+        (self.root / "config.json").write_text(json.dumps(self.config, ensure_ascii=False, indent=2))
+
+    def tool(self, name, body):
+        path = self.root / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o700)
+
+    def link(self, name, up=True, ipv4=True):
+        with (self.root / "addresses").open("a") as stream:
+            stream.write(f"5: {name}: <BROADCAST,MULTICAST{',UP' if up else ''}> mtu 1400\n")
+            if ipv4:
+                stream.write("    inet 10.172.186.147/8 scope global " + name + "\n")
+        with (self.root / "routes").open("a") as stream:
+            stream.write(f"default dev {name} table {name} proto static scope link mtu 1400\n")
+
+    def run_service(self, action):
+        return subprocess.run(["sh", "-c", self.script, "--", action], capture_output=True)
+
+    def running(self, interface):
+        (self.root / "active").touch()
+        for pid, name in ((91, "mihomo"), (92, "tailscaled")):
+            proc = self.root / f"proc/{pid}"
+            proc.mkdir(parents=True)
+            (proc / "exe").symlink_to(self.root / name)
+            (proc / "stat").write_text(" ".join(["0"] * 21 + ["123"]))
+            (self.root / f"{name}.pid").write_text(f"{pid} 123\n")
+        config = {**self.config, "interface-name": interface}
+        (self.root / "runtime.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+
+    def test_unique_eth0_and_eth8_deduplicated_and_read_only(self):
+        for interface in ("sipa_eth0", "sipa_eth8"):
+            with self.subTest(interface=interface):
+                (self.root / "routes").write_text("default dev dummy0 table dummy0\n")
+                (self.root / "addresses").write_text("")
+                self.link(interface)
+                with (self.root / "routes").open("a") as stream:
+                    stream.write(f"default via 10.0.0.1 dev {interface} table extra\n")
+                before = {p.name: p.read_bytes() for p in self.root.iterdir()}
+                result = self.run_service("uplink")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.decode().strip(), interface)
+                self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
+
+    def test_no_candidate_down_missing_address_linkdown_and_ambiguity(self):
+        for fault in ("none", "down", "no-ipv4", "linkdown", "ambiguous", "query"):
+            with self.subTest(fault=fault):
+                (self.root / "routes").write_text("")
+                (self.root / "addresses").write_text("")
+                if fault != "none":
+                    self.link("sipa_eth0", up=fault != "down", ipv4=fault != "no-ipv4")
+                if fault == "linkdown":
+                    routes = self.root / "routes"
+                    routes.write_text(routes.read_text().rstrip() + " linkdown\n")
+                if fault == "ambiguous":
+                    self.link("sipa_eth8")
+                if fault == "query":
+                    (self.root / "ip-fails").touch()
+                self.assertNotEqual(self.run_service("uplink").returncode, 0)
+                result = self.run_service("start")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "active").exists())
+                self.assertFalse((self.root / "preflight").exists())
+                self.assertFalse((self.root / "runtime.tmp").exists())
+
+    def test_render_preflights_runtime_preserves_template_policy_and_unicode(self):
+        self.link("sipa_eth0")
+        template = (self.root / "config.json").read_bytes()
+        # Force the real start to fail its preflight before starting any process or network rule.
+        self.assertNotEqual(self.run_service("start").returncode, 0)
+        runtime = self.root / "runtime.json"
+        self.assertEqual(json.loads(runtime.read_text()), {**self.config, "interface-name": "sipa_eth0"})
+        self.assertEqual(runtime.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / "config.json").read_bytes(), template)
+        self.assertEqual((self.root / "preflight").read_text().strip(),
+                         f"-t -d {self.root} -f {runtime}")
+        self.assertFalse((self.root / "active").exists())
+        self.assertFalse((self.root / "runtime.tmp").exists())
+        (self.root / "ip-fails").touch()
+        self.assertEqual(self.run_service("stop").returncode, 0)
+        self.assertFalse(runtime.exists())
+
+    def test_missing_or_duplicate_placeholder_refused_without_partial_runtime(self):
+        self.link("sipa_eth0")
+        for content in ('{"interface-name": "sipa_eth8"}',
+                        '{\n  "interface-name": "__F50_CELLULAR_INTERFACE__",\n'
+                        '  "interface-name": "__F50_CELLULAR_INTERFACE__"\n}'):
+            with self.subTest(content=content):
+                (self.root / "config.json").write_text(content)
+                self.assertNotEqual(self.run_service("start").returncode, 0)
+                self.assertFalse((self.root / "runtime.tmp").exists())
+                self.assertFalse((self.root / "runtime.json").exists())
+                self.assertFalse((self.root / "preflight").exists())
+
+    def test_check_detects_tampering_missing_runtime_and_interface_change_without_writes(self):
+        self.link("sipa_eth0")
+        self.running("sipa_eth0")
+        self.assertEqual(self.run_service("check").returncode, 0)
+        runtime = self.root / "runtime.json"
+        original = runtime.read_bytes()
+        runtime.write_bytes(original.replace(b"MATCH,", b"DIRECT,"))
+        tampered = runtime.read_bytes()
+        self.assertNotEqual(self.run_service("check").returncode, 0)
+        self.assertEqual(runtime.read_bytes(), tampered)
+        runtime.unlink()
+        self.assertNotEqual(self.run_service("check").returncode, 0)
+        self.assertFalse(runtime.exists())
+        runtime.write_bytes(original)
+        (self.root / "routes").write_text("")
+        (self.root / "addresses").write_text("")
+        self.link("sipa_eth8")
+        self.assertNotEqual(self.run_service("check").returncode, 0)
+        self.assertEqual(runtime.read_bytes(), original)
+        self.assertFalse((self.root / "runtime.tmp").exists())
+
+
 class LifecycleTest(unittest.TestCase):
     def test_network_tools_are_pinned_outside_magisk_standalone(self):
         network = (MODULE.parent / "network.sh").read_text()
@@ -284,12 +427,39 @@ class LifecycleTest(unittest.TestCase):
             self.assertFalse((root / "actions").exists())
             (root / "boot-enabled").touch()
             self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 0)
-            self.assertEqual((root / "actions").read_text(), "boot\n")
+            self.assertEqual((root / "actions").read_text(), "uplink\nboot\n")
             (root / "actions").unlink()
             with (root / "service.sh").open("a") as stream:
-                stream.write("exit 28\n")
+                stream.write('[ "$1" = uplink ] || exit 28\n')
             self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 28)
-            self.assertEqual((root / "actions").read_text(), "boot\n")
+            self.assertEqual((root / "actions").read_text(), "uplink\nboot\n")
+
+    def test_boot_waits_for_shared_uplink_and_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "boot-enabled").touch()
+            for name, body in {"getprop": "echo 1", "ip": "echo ' inet 192.168.0.1/24'",
+                               "sleep": "exit 0"}.items():
+                tool = root / name
+                tool.write_text("#!/bin/sh\n" + body + "\n")
+                tool.chmod(0o700)
+            service = root / "service.sh"
+            service.write_text(f'''echo "$1" >> "{root}/actions"
+if [ "$1" = uplink ]; then
+    [ -e "{root}/waited" ] || {{ touch "{root}/waited"; exit 29; }}
+fi
+''')
+            script = (MODULE.parent / "boot.sh").read_text().replace(
+                "ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
+            script = script.replace("/system/bin/", str(root) + "/")
+            script = script.replace("/data/adb/magisk/busybox ash", "sh")
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 0)
+            self.assertEqual((root / "actions").read_text(), "uplink\nuplink\nboot\n")
+            (root / "actions").unlink()
+            service.write_text(f'echo "$1" >> "{root}/actions"\nexit 29\n')
+            self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 1)
+            self.assertEqual((root / "actions").read_text().splitlines(), ["uplink"] * 180)
 
     def test_apply_restore_reapply_real_shell(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -351,10 +521,14 @@ class LifecycleTest(unittest.TestCase):
                     if "mv " in script and "boot.install" in script:
                         raise host.OperationError("Autostart install verification failed")
                     return result
-                for fault in ("readiness", "check", "install"):
+                service = device.service
+                for fault in ("start", "readiness", "check", "install"):
                     args.state_dir = str(base / ("failed-" + fault))
                     with self.subTest(fault=fault), contextlib.ExitStack() as stack:
-                        if fault == "readiness":
+                        if fault == "start":
+                            stack.enter_context(patch.object(device, "service", side_effect=lambda action:
+                                SimpleNamespace(returncode=29) if action == "start" else service(action)))
+                        elif fault == "readiness":
                             stack.enter_context(patch.object(host, "tailscale_status", side_effect=host.OperationError("Not ready")))
                         elif fault == "check":
                             stack.enter_context(patch.object(host, "check", return_value=20))
@@ -522,7 +696,7 @@ class LifecycleTest(unittest.TestCase):
             host.Device("fake").service("check")
             self.assertTrue(shell.call_args.args[0].startswith("/data/adb/magisk/busybox ash -c "))
         self.assertEqual((MODULE.parent / "boot.sh").read_text().count(
-            '/data/adb/magisk/busybox ash "$ROOT/service.sh"'), 2)
+            '/data/adb/magisk/busybox ash "$ROOT/service.sh"'), 3)
 
 
 if __name__ == "__main__":

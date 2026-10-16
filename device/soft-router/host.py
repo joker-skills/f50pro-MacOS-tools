@@ -62,7 +62,7 @@ def configuration(path, transparent=False):
         config.pop(key, None)
     config.update({"mixed-port": 17890, "bind-address": "127.0.0.1",
                    "allow-lan": False, "mode": "rule", "log-level": "warning",
-                   "ipv6": transparent, "interface-name": "sipa_eth8",
+                   "ipv6": transparent, "interface-name": "__F50_CELLULAR_INTERFACE__",
                    "tun": {"enable": False},
                    "dns": {**dns, "enable": transparent, "listen": "127.0.0.1:0"}})
     if transparent:
@@ -156,7 +156,8 @@ def apply(args, device):
     transparent = getattr(args, "transparent", False)
     autostart = getattr(args, "autostart", False)
     # Mihomo reads JSON as YAML; YAML rejects JSON surrogate-pair escapes for emoji.
-    config = json.dumps(configuration(Path(args.private_config), transparent), ensure_ascii=False).encode()
+    config = json.dumps(configuration(Path(args.private_config), transparent),
+                        ensure_ascii=False, indent=2).encode()
     geo = geo_assets(getattr(args, "geo_assets_dir", None))
     state = Path(args.state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -192,7 +193,6 @@ def apply(args, device):
     for name, data in geo.items():
         device.put(name, data)
     device.put("config.json", config)
-    device.require(f"{ROOT}/mihomo -t -d {ROOT} -f {ROOT}/config.json >/dev/null 2>&1")
     result = device.service("start")
     if result.returncode:
         if result.returncode != 28:
