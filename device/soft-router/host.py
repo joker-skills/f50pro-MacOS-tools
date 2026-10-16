@@ -155,7 +155,8 @@ def apply(args, device):
         raise OperationError("Asset SHA256 does not match pinned official release")
     transparent = getattr(args, "transparent", False)
     autostart = getattr(args, "autostart", False)
-    config = json.dumps(configuration(Path(args.private_config), transparent)).encode()
+    # Mihomo reads JSON as YAML; YAML rejects JSON surrogate-pair escapes for emoji.
+    config = json.dumps(configuration(Path(args.private_config), transparent), ensure_ascii=False).encode()
     geo = geo_assets(getattr(args, "geo_assets_dir", None))
     state = Path(args.state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)

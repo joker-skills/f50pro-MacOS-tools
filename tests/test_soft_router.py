@@ -309,7 +309,7 @@ class LifecycleTest(unittest.TestCase):
             (geo / "geosite.dat").write_bytes(b"cached geosite")
             (geo / "auth.json").write_bytes(b"private identity from Mac, never upload")
             private = base / "private.json"
-            private.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"]}))
+            private.write_text(json.dumps({"proxies": [{"name": "🚀 节点"}], "rules": ["MATCH,🚀 节点"]}))
             args = SimpleNamespace(serial="fake", source_oid="a" * 40,
                 assets_dir=str(assets), private_config=str(private), state_dir=str(base / "trial1"),
                 geo_assets_dir=str(geo), autostart=True)
@@ -320,6 +320,9 @@ class LifecycleTest(unittest.TestCase):
                     patch.object(host, "BOOT", str(boot)):
                 self.assertEqual(host.apply(args, device), 0)
                 self.assertTrue(boot.exists())
+                deployed_config = (base / "device/config.json").read_text()
+                self.assertIn("🚀 节点", deployed_config)
+                self.assertNotIn("\\ud83d", deployed_config)
                 self.assertEqual((base / "device/GeoSite.dat").read_bytes(), b"cached geosite")
                 self.assertFalse((base / "device/auth.json").exists())
                 for name in ("config.json", "GeoSite.dat"):
