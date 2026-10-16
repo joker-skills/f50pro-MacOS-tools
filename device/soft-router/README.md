@@ -23,6 +23,7 @@ apply 可选 `--transparent --autostart` 和 `--geo-assets-dir <本机缓存目�
   启动后的等待、自启安装或最终检查失败会撤销本次自启并调用同一 stop 收回规则和进程，
   不重启或重置身份；停止本身失败会明确报告，不重放部署。
 - `check`：0 表示本次版本进程与摘要一致；10 表示未运行；20 表示未知或不健康。
+  同时只读重选当前蜂窝口，按同一渲染计算期望摘要并比对运行配置；不会改配置或重启。
   透明模式还检查本模块的双栈规则和 hook，自启模式校验自启文件。
   **这不代替真实 USB/热点客户端的 DNS、IPv4/IPv6 HTTPS 和 UDP 业务探针。**
 - `restore` / `restore-check`：移除本次自启入口、精确撤销本模块规则、停止进程并核验停止态。保留软件和 Tailscale
@@ -50,7 +51,7 @@ hosts、sniffer 和 DNS nameserver / nameserver-policy / 节点 DNS policy 等�
 不包含国内直连规则，不能用它验收中心分流。唯一新增的分流规则是透明模式最前面的
 `DST-PORT,53,f50-dns`，配合内部 `type: dns` 出站。
 
-设备适配覆盖：出站网卡 `sipa_eth8`、rule 模式、warning 日志、关闭源 TUN 和 controller/UI，
+设备适配覆盖：启动时自动选择蜂窝出站网卡、rule 模式、warning 日志、关闭源 TUN 和 controller/UI，
 移除源额外端口、listeners、tunnels 及服务端入站配置。只保留 loopback mixed `17890`，
 透明模式再加双栈 loopback TPROXY `17891`。显式模式维持原有关闭 DNS/IPv6 的行为；
 透明模式开启 IPv6/AAAA，DNS 改为 redir-host，监听 `127.0.0.1:0`，不公开 DNS 端口。
@@ -58,6 +59,15 @@ hosts、sniffer 和 DNS nameserver / nameserver-policy / 节点 DNS policy 等�
 源 provider 的 URL、刷新间隔、相对缓存路径和健康检查保持原样，由 Mihomo 原生刷新节点/规则。
 本工具不复制 Mac 的 provider 缓存；中心的 HTTP/inline provider 可直接复用，
 依赖其它本地文件的配置须先具备设备内对应文件，不能直接引用 Mac 绝对路径。
+
+`config.json` 的顶层 `interface-name` 使用内部占位符，原文件继续按部署记录精确校验。
+启动在生命周期锁内读取 `/system/bin/ip -4 route show table all` 与 IPv4 地址，
+只接受有默认路由、UP 标记和 IPv4 地址、路由不含 linkdown 的 `sipa_eth[0-9]+`。
+同一接口的多条路由去重；没有候选、多个候选或查询失败均拒绝启动，不回退固定接口。
+只替换顶层占位字段，生成 0600 的 `runtime.json`，Mihomo 预检通过后才启动进程和透明规则。
+嵌套策略字段保持原样，不在设备上修改 manifest 或本机部署记录。
+`service.sh uplink` 提供同一只读选口入口供开机等待使用；运行中换 SIM 或接口不自动恢复，
+check 会失败，需经既有停止、启动入口恢复。断网也可停止；stop 会移除运行配置和临时文件。
 
 需要 Geo 数据且设备没有缓存时，显式指定 `--geo-assets-dir`，例如本机已有的
 `~/.config/mihomo` 或 Clash Verge 缓存目录。只读取该目录中的普通文件，不递归、不跟随文件
@@ -102,7 +112,7 @@ restore 仍只恢复停止态并保留 Tailscale 身份。宿主可在既有授�
   地址/前缀在启动时采样，运营商重新分配 LAN IPv6 前缀后需停止并重新部署以更新绕过。
   代理节点必须支持 UDP 和所需的 IPv6 目标；配置成功不能代替实测。
 - 自启只写 `/data/adb/service.d/f50-soft-router.sh`，等待开机完成、br0 和蜂窝 IPv4
-  就绪后调用同一个启动入口，最多等待 6 分钟；不修改 `f50-no-aoa.sh`。
+  经同一 `service.sh uplink` 选口成功后调用启动入口，最多等待 6 分钟；不修改 `f50-no-aoa.sh`。
   service 统一由 Magisk BusyBox ash 执行（B25 的 system sh 不能把锁 FD 传给 flock）；
   网络操作固定调用 `/system/bin/ip`、`iptables`、`ip6tables`，network.sh 固定由
   `/system/bin/sh` 执行，避免 Magisk standalone 自动选择不支持路由表编号的 BusyBox ip。
