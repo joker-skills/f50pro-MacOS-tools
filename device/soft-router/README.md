@@ -48,6 +48,7 @@ PID 被无关进程复用时不会向它发信号；最终仍通过进程扫描�
   代理节点必须支持 UDP 和所需的 IPv6 目标；配置成功不能代替实测。
 - 自启只写 `/data/adb/service.d/f50-soft-router.sh`，等待开机完成、br0 和蜂窝 IPv4
   就绪后调用同一个启动入口，最多等待 6 分钟；不修改 `f50-no-aoa.sh`。
+  service 统一由 Magisk BusyBox ash 执行（B25 的 system sh 不能把锁 FD 传给 flock）；
   BusyBox `flock -n` 防止并发启停，restore 先撤销启用标记和入口，不会停后排队重拉。
   没有进程看门狗；启动失败撤销本模块规则并停止服务，等待人工排查。
 

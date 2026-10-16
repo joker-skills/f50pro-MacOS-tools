@@ -151,6 +151,7 @@ class LifecycleTest(unittest.TestCase):
             (root / "service.sh").write_text('echo "$1" >> "' + str(root / "actions") + '"\n')
             script = (MODULE.parent / "boot.sh").read_text().replace(
                 "ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
+            script = script.replace("/data/adb/magisk/busybox ash", "sh")
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
             self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 1)
             self.assertFalse((root / "actions").exists())
@@ -315,6 +316,14 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn("/proc/$pid/exe", script)
         self.assertIn("print $22", script)
         self.assertEqual(script.count("exec 9>&-; trap '' HUP"), 2)
+        self.assertTrue(script.startswith("#!/data/adb/magisk/busybox ash"))
+
+    def test_service_uses_verified_busybox_ash_for_fd_lock(self):
+        with patch.object(host.Device, "shell") as shell:
+            host.Device("fake").service("check")
+            self.assertTrue(shell.call_args.args[0].startswith("/data/adb/magisk/busybox ash -c "))
+        self.assertEqual((MODULE.parent / "boot.sh").read_text().count(
+            '/data/adb/magisk/busybox ash "$ROOT/service.sh"'), 2)
 
 
 if __name__ == "__main__":

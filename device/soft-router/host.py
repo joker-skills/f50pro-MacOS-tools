@@ -77,7 +77,7 @@ class Device:
 
     def service(self, action):
         script = (HERE / "service.sh").read_text()
-        return self.shell(f"sh -c {shlex.quote(script)} -- {shlex.quote(action)}")
+        return self.shell(f"/data/adb/magisk/busybox ash -c {shlex.quote(script)} -- {shlex.quote(action)}")
 
 
 def private_write(path, data):

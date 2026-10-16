@@ -1,4 +1,4 @@
-#!/system/bin/sh
+#!/data/adb/magisk/busybox ash
 set -eu
 ROOT=/data/adb/f50-soft-router
 idle() {
