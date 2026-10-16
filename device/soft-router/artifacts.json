@@ -1,0 +1,17 @@
+{
+  "mihomo": {
+    "version": "1.19.32",
+    "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-android-arm64-v1.19.32.gz",
+    "archive_sha256": "42b1f2be8702484d3ae6238daab392622f54bd0d264966700f1f28f52596e326"
+  },
+  "tailscale": {
+    "version": "1.104.1",
+    "url": "https://pkgs.tailscale.com/stable/tailscale_1.104.1_arm64.tgz",
+    "archive_sha256": "f60294374967f3dfd8cf57bbbd474d6cfce32d123e3a8ddeab82a87940daa806"
+  },
+  "sha256": {
+    "mihomo": "bb9afbd48717f92d59e07da35fb694b83d40d6edb63eb9033c2ee4174137d195",
+    "tailscale": "6c2c134abad7cbbc8bc94a226b2972b4b7d5603daa0ca0bb9dc3b74a1dc15814",
+    "tailscaled": "6367abc3ffd608ed64a762928444ee53ac4e99bf19baabb0321852d7f02b10b6"
+  }
+}
