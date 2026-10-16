@@ -48,7 +48,7 @@ def configuration(path, transparent=False):
             {"name": "f50-tp6", "type": "tproxy", "listen": "::1", "port": 17891, "udp": True}],
             "proxies": source["proxies"] + [{"name": "f50-dns", "type": "dns"}],
             "rules": ["DST-PORT,53,f50-dns"] + source["rules"],
-            "dns": {"enable": True, "ipv6": True, "enhanced-mode": "redir-host",
+            "dns": {"enable": True, "listen": "127.0.0.1:0", "ipv6": True, "enhanced-mode": "redir-host",
                     "respect-rules": True, "nameserver": ["https://1.1.1.1/dns-query"],
                     "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"]}})
     return config
@@ -133,14 +133,21 @@ def apply(args, device):
     device.require(f"{ROOT}/mihomo -t -d {ROOT} -f {ROOT}/config.json >/dev/null 2>&1")
     result = device.service("start")
     if result.returncode:
-        device.service("stop")
+        if result.returncode != 28:
+            stop_deployment(device, record)
         raise OperationError("Start incomplete; use check then restore, do not replay apply")
-    tailscale_status(device, wait=True)
-    if autostart:
-        device.require(f"set -e; [ -d {str(Path(BOOT).parent)} ]; [ ! -e {BOOT} ]; umask 077; "
-                       f"cp {ROOT}/boot.sh {ROOT}/boot.install; chmod 700 {ROOT}/boot.install; "
-                       f"touch {ROOT}/boot-enabled; mv {ROOT}/boot.install {BOOT}")
-    return check(args, device)
+    try:
+        tailscale_status(device, wait=True)
+        if autostart:
+            device.require(f"set -e; [ -d {str(Path(BOOT).parent)} ]; [ ! -e {BOOT} ]; umask 077; "
+                           f"cp {ROOT}/boot.sh {ROOT}/boot.install; chmod 700 {ROOT}/boot.install; "
+                           f"touch {ROOT}/boot-enabled; mv {ROOT}/boot.install {BOOT}")
+        if check(args, device) != 0:
+            raise OperationError("Post-start verification failed")
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError):
+        stop_deployment(device, record)
+        raise
+    return 0
 
 
 def check(args, device):
@@ -197,14 +204,32 @@ def recover_partial(device, record):
     device.require(f"rmdir {ROOT}")
 
 
+def stop_deployment(device, record):
+    try:
+        device.require(f"rm -f {ROOT}/boot-enabled")
+        if record.get("autostart") and device.shell(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]").returncode != 0:
+            actual = device.require(f"sha256sum {BOOT}").decode().split()[0]
+            if actual != record["scripts_sha256"]["boot.sh"]:
+                raise OperationError("Refusing to remove unknown autostart script")
+            device.require(f"rm {BOOT}")
+    finally:
+        if device.service("stop").returncode:
+            raise OperationError("Stop incomplete; inspect before retry")
+
+
 def tailscale_status(device, wait=False):
     for attempt in range(20 if wait else 1):
         response = device.shell(f"{ROOT}/tailscale --socket={ROOT}/tailscaled.sock status --json")
-        status = json.loads(response.stdout)
+        try:
+            status = json.loads(response.stdout)
+        except ValueError:
+            if not wait:
+                raise
+            status = None
         state = status.get("BackendState") if isinstance(status, dict) else None
         if state in {"NeedsLogin", "Running", "NeedsMachineAuth", "Stopped"}:
             return status
-        if wait and state in {"Starting", "NoState"} and attempt < 19:
+        if wait and state in {"Starting", "NoState", None} and attempt < 19:
             time.sleep(1)
             continue
         raise OperationError("Tailscale has not reached a recognized ready state; inspect ts-status")
@@ -248,15 +273,7 @@ def main():
             if remote != record:
                 raise OperationError("Refusing to restore a different deployment")
             if args.command == "restore":
-                device.require(f"rm -f {ROOT}/boot-enabled")
-                if record.get("autostart"):
-                    if device.shell(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]").returncode != 0:
-                        actual = device.require(f"sha256sum {BOOT}").decode().split()[0]
-                        if actual != record["scripts_sha256"]["boot.sh"]:
-                            raise OperationError("Refusing to remove unknown autostart script")
-                        device.require(f"rm {BOOT}")
-                if device.service("stop").returncode:
-                    raise OperationError("Stop incomplete; inspect before retry")
+                stop_deployment(device, record)
             if record.get("autostart"):
                 device.require(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ] && [ ! -e {ROOT}/boot-enabled ]")
             result = 0 if check(args, device) == 10 else 20

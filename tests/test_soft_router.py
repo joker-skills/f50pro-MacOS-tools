@@ -67,7 +67,7 @@ class ExplicitConfigTest(unittest.TestCase):
             config = host.configuration(path, True)
         self.assertEqual(config["rules"][0], "DST-PORT,53,f50-dns")
         self.assertEqual(config["proxies"][-1], {"name": "f50-dns", "type": "dns"})
-        self.assertNotIn("listen", config["dns"])
+        self.assertEqual(config["dns"]["listen"], "127.0.0.1:0")
         self.assertTrue(config["dns"]["ipv6"])
         self.assertEqual({item["listen"] for item in config["listeners"]}, {"127.0.0.1", "::1"})
         self.assertFalse(config["tun"]["enable"])
@@ -160,6 +160,11 @@ class LifecycleTest(unittest.TestCase):
             (root / "boot-enabled").touch()
             self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 0)
             self.assertEqual((root / "actions").read_text(), "boot\n")
+            (root / "actions").unlink()
+            with (root / "service.sh").open("a") as stream:
+                stream.write("exit 28\n")
+            self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 28)
+            self.assertEqual((root / "actions").read_text(), "boot\n")
 
     def test_apply_restore_reapply_real_shell(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -197,6 +202,28 @@ class LifecycleTest(unittest.TestCase):
                 args.state_dir = str(base / "trial2")
                 self.assertEqual(host.apply(args, device), 0)
                 self.assertTrue(json.loads((base / "trial2/deployment.json").read_text())["directory_existed"])
+                host.stop_deployment(device, json.loads((base / "trial2/deployment.json").read_text()))
+                require = device.require
+                def failed_install(script, *, data=None):
+                    result = require(script, data=data)
+                    if "mv " in script and "boot.install" in script:
+                        raise host.OperationError("Autostart install verification failed")
+                    return result
+                for fault in ("readiness", "check", "install"):
+                    args.state_dir = str(base / ("failed-" + fault))
+                    with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                        if fault == "readiness":
+                            stack.enter_context(patch.object(host, "tailscale_status", side_effect=host.OperationError("Not ready")))
+                        elif fault == "check":
+                            stack.enter_context(patch.object(host, "check", return_value=20))
+                        else:
+                            stack.enter_context(patch.object(device, "require", side_effect=failed_install))
+                        with self.assertRaises(host.OperationError):
+                            host.apply(args, device)
+                    self.assertFalse((base / "device/active").exists())
+                    self.assertFalse((base / "device/boot-enabled").exists())
+                    self.assertFalse(boot.exists())
+                    self.assertEqual((base / "device/tailscale.state").read_text(), "private identity")
 
     def fake_service(self, root, action):
         script = (MODULE.parent / "service.sh").read_text()
@@ -279,11 +306,20 @@ class LifecycleTest(unittest.TestCase):
 
     def test_startup_wait_is_bounded(self):
         from unittest.mock import Mock
-        device = SimpleNamespace(shell=Mock(return_value=SimpleNamespace(stdout=b'{"BackendState":"Starting"}')))
-        with patch.object(host.time, "sleep") as sleep, self.assertRaises(host.OperationError):
-            host.tailscale_status(device, wait=True)
-        self.assertEqual(device.shell.call_count, 20)
-        self.assertEqual(sleep.call_count, 19)
+        for payload in (b'{"BackendState":"Starting"}', b''):
+            device = SimpleNamespace(shell=Mock(return_value=SimpleNamespace(stdout=payload)))
+            with self.subTest(payload=payload), patch.object(host.time, "sleep") as sleep, self.assertRaises(host.OperationError):
+                host.tailscale_status(device, wait=True)
+            self.assertEqual(device.shell.call_count, 20)
+            self.assertEqual(sleep.call_count, 19)
+
+    def test_startup_wait_accepts_initial_invalid_json(self):
+        from unittest.mock import Mock
+        device = SimpleNamespace(shell=Mock(side_effect=[SimpleNamespace(stdout=payload)
+            for payload in (b'', b'not-json', b'{"BackendState":"Running"}')]))
+        with patch.object(host.time, "sleep") as sleep:
+            self.assertEqual(host.tailscale_status(device, wait=True)["BackendState"], "Running")
+        self.assertEqual(sleep.call_count, 2)
 
     def test_errors_only_expose_our_safe_diagnostics(self):
         for error, expected in [(host.OperationError("Asset mismatch"), "Asset mismatch"),
