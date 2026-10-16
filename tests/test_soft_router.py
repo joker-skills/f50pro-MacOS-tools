@@ -2,6 +2,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 import subprocess
 from pathlib import Path
 import tempfile
@@ -59,8 +60,104 @@ class ExplicitConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.config({"rules": ["RULE-SET,private,test"]})
 
+    def test_transparent_dns_is_internal_and_both_listeners_are_loopback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"]}))
+            config = host.configuration(path, True)
+        self.assertEqual(config["rules"][0], "DST-PORT,53,f50-dns")
+        self.assertEqual(config["proxies"][-1], {"name": "f50-dns", "type": "dns"})
+        self.assertNotIn("listen", config["dns"])
+        self.assertTrue(config["dns"]["ipv6"])
+        self.assertEqual({item["listen"] for item in config["listeners"]}, {"127.0.0.1", "::1"})
+        self.assertFalse(config["tun"]["enable"])
+
+
+class TransparentNetworkTest(unittest.TestCase):
+    def test_real_shell_owns_only_scoped_dual_stack_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "owner").write_text("f50-soft-router-v1\n")
+            kernel = root / "kernel"
+            kernel.write_text("#!" + host.sys.executable + "\n" + r'''
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['FAKE_KERNEL'])
+statefile = root / 'kernel.json'
+state = json.loads(statefile.read_text()) if statefile.exists() else {}
+name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+with (root / 'commands').open('a') as log: log.write(name + ' ' + ' '.join(args) + '\n')
+rc, out = 0, ''
+if name == 'ip':
+    family, kind, op = args[:3]
+    key = family + kind
+    if kind == 'addr':
+        out = ' inet 192.168.0.1/24\n' if family == '-4' else ' inet6 2001:db8::1/64\n'
+    elif op == 'add': state[key] = True
+    elif op == 'del': state.pop(key, None)
+    elif op == 'show' and state.get(key):
+        out = '1789: from all fwmark 0x80000000/0x80000000 iif br0 lookup 17891\n' if kind == 'rule' else 'local default dev lo scope host\n'
+else:
+    args = args[2:]
+    table = 'filter'
+    if args[:1] == ['-t']: table, args = args[1], args[2:]
+    op, chain = args[:2]
+    rest = args[2:]
+    if op == '-I': rest = rest[1:]
+    key = name + table + chain
+    rule = ' '.join(rest)
+    if op in ('-S', '-C'):
+        rc = 0 if key in state and (op == '-S' or rule in state[key]) else 1
+    elif op == '-N': state[key] = []
+    elif op in ('-A', '-I'): state.setdefault(key, []).append(rule)
+    elif op == '-D': state[key].remove(rule)
+    elif op == '-F': state[key] = []
+    elif op == '-X': state.pop(key)
+statefile.write_text(json.dumps(state))
+sys.stdout.write(out)
+sys.exit(rc)
+''')
+            kernel.chmod(0o700)
+            for name in ("ip", "iptables", "ip6tables"):
+                (root / name).symlink_to(kernel)
+            script = (MODULE.parent / "network.sh").read_text().replace(
+                "ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"], "FAKE_KERNEL": str(root)}
+            for action in ("prepare", "enable", "check", "cleanup", "cleanup"):
+                result = subprocess.run(["sh", "-c", script, "--", action], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+            lines = (root / "commands").read_text().splitlines()
+            for name in ("iptables", "ip6tables"):
+                rules = [line for line in lines if line.startswith(name) and " -A F50SR_TP " in line]
+                self.assertTrue(all("--dport 53" in line for line in rules[:2]))
+                self.assertTrue(any("-p tcp -j TPROXY" in line for line in rules))
+                self.assertTrue(any("-p udp -j TPROXY" in line for line in rules))
+            self.assertFalse(any(" -t nat " in line or " OUTPUT " in line or " FORWARD " in line for line in lines))
+            additions = [line for line in lines if " rule add " in line]
+            self.assertEqual(len(additions), 2)
+            self.assertTrue(all("iif br0" in line for line in additions))
+            self.assertFalse((root / "network-owned").exists())
+            state = json.loads((root / "kernel.json").read_text())
+            self.assertTrue(all(value == [] for value in state.values()))
+
 
 class LifecycleTest(unittest.TestCase):
+    def test_boot_requires_enable_marker_and_runs_single_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, output in (("getprop", "1"), ("ip", " inet 192.168.0.1/24")):
+                executable = root / name
+                executable.write_text("#!/bin/sh\necho '" + output + "'\n")
+                executable.chmod(0o700)
+            (root / "service.sh").write_text('echo "$1" >> "' + str(root / "actions") + '"\n')
+            script = (MODULE.parent / "boot.sh").read_text().replace(
+                "ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
+            self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 1)
+            self.assertFalse((root / "actions").exists())
+            (root / "boot-enabled").touch()
+            self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 0)
+            self.assertEqual((root / "actions").read_text(), "boot\n")
+
     def test_apply_restore_reapply_real_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -72,17 +169,27 @@ class LifecycleTest(unittest.TestCase):
             (assets / "artifacts.json").write_text(json.dumps({"sha256": {
                 name: host.digest(assets / name) for name in ("mihomo", "tailscale", "tailscaled")}}))
             (assets / "service.sh").write_bytes((MODULE.parent / "service.sh").read_bytes())
+            for name in ("network.sh", "boot.sh"):
+                (assets / name).write_bytes((MODULE.parent / name).read_bytes())
             private = base / "private.json"
             private.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"]}))
             args = SimpleNamespace(serial="fake", source_oid="a" * 40,
-                assets_dir=str(assets), private_config=str(private), state_dir=str(base / "trial1"))
+                assets_dir=str(assets), private_config=str(private), state_dir=str(base / "trial1"), autostart=True)
             device = LocalShellDevice("fake")
-            with patch.object(host, "ROOT", str(base / "device")), patch.object(host, "HERE", assets):
+            (base / "service.d").mkdir()
+            boot = base / "service.d/f50-soft-router.sh"
+            with patch.object(host, "ROOT", str(base / "device")), patch.object(host, "HERE", assets), \
+                    patch.object(host, "BOOT", str(boot)):
                 self.assertEqual(host.apply(args, device), 0)
+                self.assertTrue(boot.exists())
+                (base / "device/tailscale.state").write_text("private identity")
                 argv = ["host.py", "restore", "--serial", "fake", "--source-oid", args.source_oid,
                         "--state-dir", args.state_dir]
                 with patch.object(host.sys, "argv", argv), patch.object(host, "Device", return_value=device):
                     self.assertEqual(host.main(), 0)
+                self.assertFalse(boot.exists())
+                self.assertFalse((base / "device/boot-enabled").exists())
+                self.assertEqual((base / "device/tailscale.state").read_text(), "private identity")
                 self.assertEqual(host.check(args, device), 10)
                 args.state_dir = str(base / "trial2")
                 self.assertEqual(host.apply(args, device), 0)
@@ -92,6 +199,7 @@ class LifecycleTest(unittest.TestCase):
         script = (MODULE.parent / "service.sh").read_text()
         script = script.replace("ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
         script = script.replace("/proc/", f"{root}/proc/")
+        script = script.replace("/data/adb/magisk/busybox flock -n 9", "true")
         return subprocess.run(["sh", "-c", script, "--", action], capture_output=True)
 
     def test_recycled_pid_refuses_stop(self):
@@ -199,13 +307,14 @@ class LifecycleTest(unittest.TestCase):
             self.assertNotIn("private-password", str(run.call_args.args))
             self.assertEqual(run.call_args.kwargs["input"], b"private-password")
 
-    def test_service_has_no_firmware_network_or_autostart_mutations(self):
+    def test_service_never_flashes_or_changes_system_network_directly(self):
         script = (MODULE.parent / "service.sh").read_text()
-        for forbidden in ("iptables", "ip rule", "ip route", "service.d", "spd_dump", "init_boot"):
+        for forbidden in ("iptables", "ip rule", "ip route", "spd_dump", "init_boot"):
             self.assertNotIn(forbidden, script)
         self.assertIn("--tun=userspace-networking", script)
         self.assertIn("/proc/$pid/exe", script)
         self.assertIn("print $22", script)
+        self.assertEqual(script.count("exec 9>&-; trap '' HUP"), 2)
 
 
 if __name__ == "__main__":

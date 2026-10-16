@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 1: loopback explicit proxy and userspace Tailscale; never flash firmware."""
+"""Software-only explicit/transparent LAN proxy and userspace Tailscale."""
 import argparse
 import fcntl
 import hashlib
@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 ROOT = "/data/adb/f50-soft-router"
+BOOT = "/data/adb/service.d/f50-soft-router.sh"
 HERE = Path(__file__).resolve().parent
 
 
@@ -24,7 +25,7 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def configuration(path):
+def configuration(path, transparent=False):
     source = json.loads(path.read_text())
     allowed = {"proxies", "proxy-groups", "rules", "mixed-port", "bind-address",
                "allow-lan", "mode", "log-level", "ipv6", "tun", "dns", "interface-name"}
@@ -34,10 +35,22 @@ def configuration(path):
         raise OperationError("At least one proxy and routing rule are required")
     if any(not rule.startswith("MATCH,") for rule in source["rules"]):
         raise OperationError("Stage 1 supports MATCH rules only")
-    return {**source, "mixed-port": 17890, "bind-address": "127.0.0.1",
+    config = {**source, "mixed-port": 17890, "bind-address": "127.0.0.1",
             "allow-lan": False, "mode": "rule", "log-level": "warning",
             "ipv6": False, "interface-name": "sipa_eth8",
             "tun": {"enable": False}, "dns": {"enable": False}}
+    if transparent:
+        if any(proxy.get("name") == "f50-dns" for proxy in source["proxies"]):
+            raise OperationError("Reserved proxy name f50-dns")
+        config.update({"ipv6": True, "listeners": [
+            {"name": "f50-tp4", "type": "tproxy", "listen": "127.0.0.1", "port": 17891, "udp": True},
+            {"name": "f50-tp6", "type": "tproxy", "listen": "::1", "port": 17891, "udp": True}],
+            "proxies": source["proxies"] + [{"name": "f50-dns", "type": "dns"}],
+            "rules": ["DST-PORT,53,f50-dns"] + source["rules"],
+            "dns": {"enable": True, "ipv6": True, "enhanced-mode": "redir-host",
+                    "respect-rules": True, "nameserver": ["https://1.1.1.1/dns-query"],
+                    "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"]}})
+    return config
 
 
 class Device:
@@ -81,7 +94,9 @@ def apply(args, device):
     actual = {name: digest(assets / name) for name in pins["sha256"]}
     if actual != pins["sha256"]:
         raise OperationError("Asset SHA256 does not match pinned official release")
-    config = json.dumps(configuration(Path(args.private_config))).encode()
+    transparent = getattr(args, "transparent", False)
+    autostart = getattr(args, "autostart", False)
+    config = json.dumps(configuration(Path(args.private_config), transparent)).encode()
     state = Path(args.state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state, 0o700)
@@ -94,9 +109,12 @@ def apply(args, device):
             raise OperationError("Existing deployment is not verifiably stopped")
     elif exists != b"absent":
         raise OperationError("Unknown device directory state")
+    device.require(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]")
     record = {"serial": args.serial, "source_oid": args.source_oid,
               "sha256": actual, "config_sha256": hashlib.sha256(config).hexdigest(),
               "service_sha256": digest(HERE / "service.sh"),
+              "scripts_sha256": {name: digest(HERE / name) for name in ("network.sh", "boot.sh")},
+              "transparent": transparent, "autostart": autostart,
               "baseline": "stopped", "directory_existed": exists == b"exists"}
     private_write(state / "deployment.json", record)
     if exists == b"absent":
@@ -105,6 +123,9 @@ def apply(args, device):
     device.put("owner", b"f50-soft-router-v1\n")
     device.put("deployment.json", json.dumps(record).encode())
     device.put("service.sh", (HERE / "service.sh").read_bytes(), executable=True)
+    for name in record["scripts_sha256"]:
+        device.put(name, (HERE / name).read_bytes(), executable=True)
+    device.put("mode", b"transparent\n" if transparent else b"explicit\n")
     for name in actual:
         device.put(name, (assets / name).read_bytes(), executable=True)
     device.put("config.json", config)
@@ -113,6 +134,10 @@ def apply(args, device):
     if result.returncode:
         device.service("stop")
         raise OperationError("Start incomplete; use check then restore, do not replay apply")
+    if autostart:
+        device.require(f"set -e; [ -d {str(Path(BOOT).parent)} ]; [ ! -e {BOOT} ]; umask 077; "
+                       f"cp {ROOT}/boot.sh {ROOT}/boot.install; chmod 700 {ROOT}/boot.install; "
+                       f"touch {ROOT}/boot-enabled; mv {ROOT}/boot.install {BOOT}")
     return check(args, device)
 
 
@@ -130,6 +155,9 @@ def check(args, device):
             return 20
     if args.source_oid and record["source_oid"] != args.source_oid:
         return 20
+    mode = device.require(f"cat {ROOT}/mode").decode().strip()
+    if mode != ("transparent" if record["transparent"] else "explicit"):
+        return 20
     pinned = json.loads((HERE / "artifacts.json").read_text())["sha256"]
     if record["sha256"] != pinned:
         return 20
@@ -137,9 +165,17 @@ def check(args, device):
         return 20
     expected = {**pinned, "config.json": record["config_sha256"],
                 "service.sh": record["service_sha256"]}
+    for name in ("network.sh", "boot.sh"):
+        if record["scripts_sha256"][name] != digest(HERE / name):
+            return 20
+        expected[name] = record["scripts_sha256"][name]
     for name, sha in expected.items():
         got = device.require(f"sha256sum {ROOT}/{shlex.quote(name)}").decode().split()[0]
         if got != sha:
+            return 20
+    if record["autostart"]:
+        boot_hash = device.require(f"[ -f {ROOT}/boot-enabled ] && sha256sum {BOOT}").decode().split()[0]
+        if boot_hash != record["scripts_sha256"]["boot.sh"]:
             return 20
     tailscale_status(device)
     return 0
@@ -176,6 +212,8 @@ def main():
     parser.add_argument("--assets-dir")
     parser.add_argument("--private-config")
     parser.add_argument("--state-dir")
+    parser.add_argument("--transparent", action="store_true")
+    parser.add_argument("--autostart", action="store_true")
     args = parser.parse_args()
     device = Device(args.serial)
     lock = None
@@ -204,8 +242,17 @@ def main():
             if remote != record:
                 raise OperationError("Refusing to restore a different deployment")
             if args.command == "restore":
+                device.require(f"rm -f {ROOT}/boot-enabled")
+                if record.get("autostart"):
+                    if device.shell(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]").returncode != 0:
+                        actual = device.require(f"sha256sum {BOOT}").decode().split()[0]
+                        if actual != record["scripts_sha256"]["boot.sh"]:
+                            raise OperationError("Refusing to remove unknown autostart script")
+                        device.require(f"rm {BOOT}")
                 if device.service("stop").returncode:
                     raise OperationError("Stop incomplete; inspect before retry")
+            if record.get("autostart"):
+                device.require(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ] && [ ! -e {ROOT}/boot-enabled ]")
             result = 0 if check(args, device) == 10 else 20
         else:
             if check(args, device) != 0:
