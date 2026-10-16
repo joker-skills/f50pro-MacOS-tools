@@ -27,31 +27,89 @@ def digest(path):
 
 
 def configuration(path, transparent=False):
-    source = json.loads(path.read_text())
-    allowed = {"proxies", "proxy-groups", "rules", "mixed-port", "bind-address",
-               "allow-lan", "mode", "log-level", "ipv6", "tun", "dns", "interface-name"}
-    if not isinstance(source, dict) or set(source) - allowed:
-        raise OperationError("Only explicit proxy configuration is supported")
-    if not source.get("proxies") or not source.get("rules"):
-        raise OperationError("At least one proxy and routing rule are required")
-    if any(not rule.startswith("MATCH,") for rule in source["rules"]):
-        raise OperationError("Stage 1 supports MATCH rules only")
-    config = {**source, "mixed-port": 17890, "bind-address": "127.0.0.1",
-            "allow-lan": False, "mode": "rule", "log-level": "warning",
-            "ipv6": False, "interface-name": "sipa_eth8",
-            "tun": {"enable": False}, "dns": {"enable": False}}
+    text = path.read_text()
+    try:
+        source = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import yaml
+        except ImportError:
+            raise OperationError("YAML input requires PyYAML on the host") from None
+        try:
+            source = yaml.safe_load(text)
+        except yaml.YAMLError:
+            raise OperationError("Invalid private YAML configuration") from None
+    if not isinstance(source, dict):
+        raise OperationError("Private configuration must be a mapping")
+    rules = source.get("rules")
+    proxies = source.get("proxies", [])
+    providers = source.get("proxy-providers", {})
+    groups = source.get("proxy-groups", [])
+    dns = source.get("dns", {})
+    if (not isinstance(rules, list) or not rules or
+            any(not isinstance(rule, str) for rule in rules) or
+            not isinstance(proxies, list) or any(not isinstance(p, dict) for p in proxies) or
+            not isinstance(providers, dict) or not (proxies or providers) or
+            not isinstance(groups, list) or any(not isinstance(g, dict) for g in groups) or
+            not isinstance(dns, dict)):
+        raise OperationError("Proxy configuration requires proxies/providers, rules and a DNS mapping")
+    # Keep the central routing policy; replace only device ingress and interface settings.
+    config = dict(source)
+    for key in ("port", "socks-port", "redir-port", "tproxy-port", "listeners", "tunnels",
+                "ss-config", "vmess-config", "tuic-server", "external-controller",
+                "external-controller-tls", "external-controller-unix", "external-controller-pipe",
+                "external-controller-cors", "external-ui", "external-ui-name", "external-ui-url", "secret"):
+        config.pop(key, None)
+    config.update({"mixed-port": 17890, "bind-address": "127.0.0.1",
+                   "allow-lan": False, "mode": "rule", "log-level": "warning",
+                   "ipv6": transparent, "interface-name": "sipa_eth8",
+                   "tun": {"enable": False},
+                   "dns": {**dns, "enable": transparent, "listen": "127.0.0.1:0"}})
     if transparent:
-        if any(proxy.get("name") == "f50-dns" for proxy in source["proxies"]):
+        if any(proxy.get("name") == "f50-dns" for proxy in proxies) or any(
+                group.get("name") == "f50-dns" for group in groups):
             raise OperationError("Reserved proxy name f50-dns")
-        config.update({"ipv6": True, "listeners": [
+        # Legacy single-node JSON had no DNS settings; keep its original bootstrap defaults.
+        resolver = dns if "nameserver" in dns else {
+            "respect-rules": True, "nameserver": ["https://1.1.1.1/dns-query"],
+            "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"], **dns}
+        config.update({"listeners": [
             {"name": "f50-tp4", "type": "tproxy", "listen": "127.0.0.1", "port": 17891, "udp": True},
             {"name": "f50-tp6", "type": "tproxy", "listen": "::1", "port": 17891, "udp": True}],
-            "proxies": source["proxies"] + [{"name": "f50-dns", "type": "dns"}],
-            "rules": ["DST-PORT,53,f50-dns"] + source["rules"],
-            "dns": {"enable": True, "listen": "127.0.0.1:0", "ipv6": True, "enhanced-mode": "redir-host",
-                    "respect-rules": True, "nameserver": ["https://1.1.1.1/dns-query"],
-                    "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"]}})
+            "proxies": proxies + [{"name": "f50-dns", "type": "dns"}],
+            "rules": ["DST-PORT,53,f50-dns"] + rules,
+            "dns": {**resolver, "enable": True, "listen": "127.0.0.1:0", "ipv6": True,
+                    "enhanced-mode": "redir-host"}})
     return config
+
+
+# Mihomo filenames differ in case from Clash Verge's Mac cache; normalize on Android.
+GEO_FILES = (("GeoSite.dat", "geosite.dat"), ("GeoIP.dat", "geoip.dat"),
+             ("Country.mmdb", "country.mmdb"), ("ASN.mmdb",))
+
+
+def geo_assets(directory):
+    if directory is None:
+        return {}
+    root = Path(directory).resolve(strict=True)
+    if not root.is_dir():
+        raise OperationError("Geo assets must be an explicit directory")
+    assets = {}
+    entries = set(os.listdir(root))
+    for names in GEO_FILES:
+        candidates = [root / name for name in names if name in entries]
+        if len(candidates) > 1:
+            raise OperationError("Ambiguous Geo asset filenames")
+        if candidates:
+            path = candidates[0]
+            if path.is_symlink() or not path.is_file():
+                raise OperationError("Geo assets must be regular files inside the supplied directory")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                assets[names[0]] = stream.read()
+    if not assets:
+        raise OperationError("No supported Geo assets in supplied directory")
+    return assets
 
 
 class Device:
@@ -97,7 +155,9 @@ def apply(args, device):
         raise OperationError("Asset SHA256 does not match pinned official release")
     transparent = getattr(args, "transparent", False)
     autostart = getattr(args, "autostart", False)
-    config = json.dumps(configuration(Path(args.private_config), transparent)).encode()
+    # Mihomo reads JSON as YAML; YAML rejects JSON surrogate-pair escapes for emoji.
+    config = json.dumps(configuration(Path(args.private_config), transparent), ensure_ascii=False).encode()
+    geo = geo_assets(getattr(args, "geo_assets_dir", None))
     state = Path(args.state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state, 0o700)
@@ -129,6 +189,8 @@ def apply(args, device):
     device.put("mode", b"transparent\n" if transparent else b"explicit\n")
     for name in actual:
         device.put(name, (assets / name).read_bytes(), executable=True)
+    for name, data in geo.items():
+        device.put(name, data)
     device.put("config.json", config)
     device.require(f"{ROOT}/mihomo -t -d {ROOT} -f {ROOT}/config.json >/dev/null 2>&1")
     result = device.service("start")
@@ -241,7 +303,8 @@ def main():
     parser.add_argument("--serial", required=True)
     parser.add_argument("--source-oid")
     parser.add_argument("--assets-dir")
-    parser.add_argument("--private-config")
+    parser.add_argument("--private-config", help="Private central Mihomo YAML or legacy JSON")
+    parser.add_argument("--geo-assets-dir", help="Optional local directory of cached Mihomo Geo assets")
     parser.add_argument("--state-dir")
     parser.add_argument("--transparent", action="store_true")
     parser.add_argument("--autostart", action="store_true")

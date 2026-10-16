@@ -51,26 +51,133 @@ class ExplicitConfigTest(unittest.TestCase):
         self.assertEqual(cfg["mixed-port"], 17890)
         self.assertEqual(cfg["interface-name"], "sipa_eth8")
 
-    def test_rejects_controller_and_external_providers(self):
-        for key in ("external-controller", "proxy-providers", "listeners"):
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                self.config({key: {}})
+    def test_removes_source_ingress_and_controller(self):
+        extra = {key: "source-setting" for key in ("port", "socks-port", "redir-port", "tproxy-port",
+                 "listeners", "tunnels", "ss-config", "vmess-config", "tuic-server",
+                 "external-controller", "external-controller-tls", "external-controller-unix",
+                 "external-controller-pipe", "external-controller-cors", "external-ui", "external-ui-name",
+                 "external-ui-url", "secret")}
+        cfg = self.config(extra)
+        self.assertFalse(set(extra) & set(cfg))
 
-    def test_rejects_rules_requiring_external_files(self):
-        with self.assertRaises(ValueError):
-            self.config({"rules": ["RULE-SET,private,test"]})
+    def test_preserves_central_policy_for_yaml_and_json(self):
+        import yaml
+        source = {
+            "proxies": [{"name": "test", "type": "ss", "server": "node.invalid", "port": 443}],
+            "proxy-groups": [{"name": "auto", "type": "select", "use": ["airport"]}],
+            "proxy-providers": {"airport": {"type": "http", "url": "https://subscription.invalid/feed",
+                "path": "./providers/airport.yaml", "interval": 3600}},
+            "rule-providers": {"cn": {"type": "http", "behavior": "domain",
+                "url": "https://rules.invalid/cn", "path": "./rules/cn.yaml", "interval": 86400}},
+            "rules": ["RULE-SET,cn,DIRECT", "GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT", "MATCH,auto"],
+            "hosts": {"router.test": "192.168.0.1"},
+            "sniffer": {"enable": True, "sniff": {"TLS": {"ports": [443]}}},
+            "geodata-mode": True, "geo-auto-update": True,
+            "dns": {"enable": True, "listen": "0.0.0.0:53", "ipv6": False, "enhanced-mode": "fake-ip",
+                "nameserver": ["https://223.5.5.5/dns-query"], "default-nameserver": ["223.5.5.5"],
+                "proxy-server-nameserver": ["119.29.29.29"],
+                "nameserver-policy": {"geosite:cn": ["https://223.5.5.5/dns-query"]},
+                "proxy-server-nameserver-policy": {"node.invalid": ["119.29.29.29"]},
+                "respect-rules": False},
+        }
+        for encode in (json.dumps, yaml.safe_dump):
+            for transparent in (False, True):
+                with self.subTest(format=encode.__name__, transparent=transparent), tempfile.TemporaryDirectory() as d:
+                    # Content decides the format, including subscription files without a suffix.
+                    path = Path(d) / "private"
+                    path.write_text(encode(source))
+                    cfg = host.configuration(path, transparent)
+                    for key in ("proxy-groups", "proxy-providers", "rule-providers", "hosts", "sniffer",
+                                "geodata-mode", "geo-auto-update"):
+                        self.assertEqual(cfg[key], source[key])
+                    self.assertEqual(cfg["rules"][1:] if transparent else cfg["rules"], source["rules"])
+                    self.assertEqual(cfg["proxies"][:-1] if transparent else cfg["proxies"], source["proxies"])
+                    for key in ("nameserver", "default-nameserver", "proxy-server-nameserver",
+                                "nameserver-policy", "proxy-server-nameserver-policy", "respect-rules"):
+                        self.assertEqual(cfg["dns"][key], source["dns"][key])
+                    if transparent:
+                        self.assertEqual(cfg["dns"]["enhanced-mode"], "redir-host")
+                        self.assertEqual(cfg["rules"][0], "DST-PORT,53,f50-dns")
+                    self.assertEqual(cfg["dns"]["listen"], "127.0.0.1:0")
+        # The same provider can supply every proxy without inline nodes.
+        source.pop("proxies")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "provider.yaml"
+            path.write_text(yaml.safe_dump(source))
+            cfg = host.configuration(path, True)
+            self.assertEqual(cfg["proxies"], [{"name": "f50-dns", "type": "dns"}])
+
+    def test_invalid_input_and_reserved_dns_name_are_safe(self):
+        for extra in ({"rules": "MATCH,test"}, {"rules": [1]}, {"proxies": ["invalid"]},
+                      {"proxy-groups": ["invalid"]}, {"dns": []},
+                      {"proxies": [{"name": "f50-dns"}]}, {"proxy-groups": [{"name": "f50-dns"}]}):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "private"
+                path.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"], **extra}))
+                with self.assertRaises(host.OperationError):
+                    host.configuration(path, True)
+        for content in ("- private-token", "dns: [private-token", "!!python/object:private-token {}"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "private"
+                path.write_text(content)
+                with self.assertRaises(host.OperationError) as exc:
+                    host.configuration(path, True)
+                self.assertNotIn("private-token", str(exc.exception))
+
+    def test_json_does_not_require_yaml_dependency(self):
+        with patch.dict(host.sys.modules, {"yaml": None}):
+            self.assertEqual(self.config({})["rules"], ["MATCH,test"])
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "private"
+                path.write_text("rules: [MATCH,test]")
+                with self.assertRaisesRegex(host.OperationError, "requires PyYAML"):
+                    host.configuration(path)
 
     def test_transparent_dns_is_internal_and_both_listeners_are_loopback(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            path.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"]}))
+            path.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"],
+                                        "dns": {"enable": False}}))
             config = host.configuration(path, True)
         self.assertEqual(config["rules"][0], "DST-PORT,53,f50-dns")
         self.assertEqual(config["proxies"][-1], {"name": "f50-dns", "type": "dns"})
         self.assertEqual(config["dns"]["listen"], "127.0.0.1:0")
         self.assertTrue(config["dns"]["ipv6"])
+        self.assertEqual(config["dns"]["nameserver"], ["https://1.1.1.1/dns-query"])
         self.assertEqual({item["listen"] for item in config["listeners"]}, {"127.0.0.1", "::1"})
         self.assertFalse(config["tun"]["enable"])
+
+
+class GeoAssetsTest(unittest.TestCase):
+    def test_upload_allowlist_normalizes_mac_cache_names(self):
+        self.assertEqual(host.geo_assets(None), {})
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for name in ("geosite.dat", "geoip.dat", "Country.mmdb", "ASN.mmdb", "config.yaml", "auth.json"):
+                (root / name).write_bytes(name.encode())
+            self.assertEqual(host.geo_assets(d), {"GeoSite.dat": b"geosite.dat", "GeoIP.dat": b"geoip.dat",
+                "Country.mmdb": b"Country.mmdb", "ASN.mmdb": b"ASN.mmdb"})
+
+    def test_rejects_symlink_escape_and_non_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cache = root / "cache"
+            cache.mkdir()
+            private = root / "private"
+            private.write_text("private-token")
+            for target in (private, root / "missing"):
+                path = cache / "GeoSite.dat"
+                path.symlink_to(target)
+                with self.assertRaises(host.OperationError):
+                    host.geo_assets(cache)
+                path.unlink()
+            (cache / "GeoSite.dat").mkdir()
+            with self.assertRaises(host.OperationError):
+                host.geo_assets(cache)
+            with self.assertRaises(host.OperationError):
+                host.geo_assets(private)
+            with self.assertRaises(host.OperationError):
+                host.geo_assets(root)
 
 
 class TransparentNetworkTest(unittest.TestCase):
@@ -197,10 +304,15 @@ class LifecycleTest(unittest.TestCase):
             (assets / "service.sh").write_bytes((MODULE.parent / "service.sh").read_bytes())
             for name in ("network.sh", "boot.sh"):
                 (assets / name).write_bytes((MODULE.parent / name).read_bytes())
+            geo = base / "geo"
+            geo.mkdir()
+            (geo / "geosite.dat").write_bytes(b"cached geosite")
+            (geo / "auth.json").write_bytes(b"private identity from Mac, never upload")
             private = base / "private.json"
-            private.write_text(json.dumps({"proxies": [{"name": "test"}], "rules": ["MATCH,test"]}))
+            private.write_text(json.dumps({"proxies": [{"name": "🚀 节点"}], "rules": ["MATCH,🚀 节点"]}))
             args = SimpleNamespace(serial="fake", source_oid="a" * 40,
-                assets_dir=str(assets), private_config=str(private), state_dir=str(base / "trial1"), autostart=True)
+                assets_dir=str(assets), private_config=str(private), state_dir=str(base / "trial1"),
+                geo_assets_dir=str(geo), autostart=True)
             device = LocalShellDevice("fake")
             (base / "service.d").mkdir()
             boot = base / "service.d/f50-soft-router.sh"
@@ -208,6 +320,18 @@ class LifecycleTest(unittest.TestCase):
                     patch.object(host, "BOOT", str(boot)):
                 self.assertEqual(host.apply(args, device), 0)
                 self.assertTrue(boot.exists())
+                deployed_config = (base / "device/config.json").read_text()
+                self.assertIn("🚀 节点", deployed_config)
+                self.assertNotIn("\\ud83d", deployed_config)
+                self.assertEqual((base / "device/GeoSite.dat").read_bytes(), b"cached geosite")
+                self.assertFalse((base / "device/auth.json").exists())
+                for name in ("config.json", "GeoSite.dat"):
+                    self.assertEqual((base / "device" / name).stat().st_mode & 0o777, 0o600)
+                self.assertEqual((base / "device").stat().st_mode & 0o777, 0o700)
+                running_args = SimpleNamespace(**{**vars(args), "state_dir": str(base / "running")})
+                with self.assertRaisesRegex(host.OperationError, "verifiably stopped"):
+                    host.apply(running_args, device)
+                self.assertTrue((base / "device/active").exists())
                 (base / "device/tailscale.state").write_text("private identity")
                 argv = ["host.py", "restore", "--serial", "fake", "--source-oid", args.source_oid,
                         "--state-dir", args.state_dir]
