@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -20,6 +22,10 @@ class LocalShellDevice(host.Device):
         return subprocess.run(["sh", "-c", script], input=data, capture_output=True)
 
     def service(self, action):
+        if action == "idle":
+            script = (MODULE.parent / "service.sh").read_text().replace(
+                "ROOT=/data/adb/f50-soft-router", f"ROOT={host.ROOT}")
+            return self.shell(f"sh -c {host.shlex.quote(script)} -- idle")
         # Only Android process execution is replaced, by a controlled shell service.
         commands = {"start": "touch active", "stop": "rm -f active",
                     "check": "if [ -e active ]; then exit 0; else exit 10; fi"}
@@ -99,8 +105,66 @@ class LifecycleTest(unittest.TestCase):
             (proc / "exe").symlink_to(root / "mihomo")
             (proc / "stat").write_text(" ".join(["0"] * 21 + ["123"]))
             result = self.fake_service(root, "stop")
-            self.assertEqual(result.returncode, 23)
+            self.assertEqual(result.returncode, 27)
             self.assertTrue((root / "active").exists())
+
+    def test_recycled_pid_with_unrelated_executable_clears_stale_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "owner").write_text("f50-soft-router-v1\n")
+            (root / "active").touch()
+            (root / "mihomo.pid").write_text("99 124\n")
+            proc = root / "proc/99"
+            proc.mkdir(parents=True)
+            (proc / "exe").symlink_to("/usr/bin/true")
+            (proc / "stat").write_text(" ".join(["0"] * 21 + ["123"]))
+            self.assertEqual(self.fake_service(root, "stop").returncode, 0)
+            self.assertFalse((root / "active").exists())
+            self.assertFalse((root / "mihomo.pid").exists())
+
+    def test_partial_upload_absent_and_empty_directory_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "device"
+            with patch.object(host, "ROOT", str(root)):
+                device = LocalShellDevice("fake")
+                host.recover_partial(device, {"directory_existed": False})
+                root.mkdir()
+                host.recover_partial(device, {"directory_existed": False})
+                self.assertFalse(root.exists())
+
+    def test_partial_upload_preserves_unknown_content_and_existing_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "device"
+            root.mkdir()
+            with patch.object(host, "ROOT", str(root)):
+                device = LocalShellDevice("fake")
+                with self.assertRaises(host.OperationError):
+                    host.recover_partial(device, {"directory_existed": True})
+                (root / "tailscale.state").write_text("private identity")
+                with self.assertRaises(host.OperationError):
+                    host.recover_partial(device, {"directory_existed": False})
+                self.assertEqual((root / "tailscale.state").read_text(), "private identity")
+
+    def test_ts_status_accepts_nonzero_valid_needs_login_json(self):
+        device = SimpleNamespace(shell=lambda _: SimpleNamespace(returncode=1,
+            stdout=b'{"BackendState":"NeedsLogin","TailscaleIPs":[]}'))
+        output = io.StringIO()
+        with patch.object(host, "Device", return_value=device), patch.object(host, "check", return_value=0), \
+                patch.object(host.sys, "argv", ["host.py", "ts-status", "--serial", "fake"]), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(host.main(), 0)
+        self.assertIn('"BackendState": "NeedsLogin"', output.getvalue())
+
+    def test_errors_only_expose_our_safe_diagnostics(self):
+        for error, expected in [(host.OperationError("Asset mismatch"), "Asset mismatch"),
+                (json.JSONDecodeError("private-token", "private-config", 0), "JSONDecodeError")]:
+            output = io.StringIO()
+            with patch.object(host, "check", side_effect=error), \
+                    patch.object(host.sys, "argv", ["host.py", "check", "--serial", "fake"]), \
+                    contextlib.redirect_stderr(output):
+                self.assertEqual(host.main(), 20)
+            self.assertIn(expected, output.getvalue())
+            self.assertNotIn("private", output.getvalue())
 
     def test_orphan_without_pid_file_is_not_reported_stopped(self):
         with tempfile.TemporaryDirectory() as directory:

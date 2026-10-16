@@ -1,6 +1,16 @@
 #!/system/bin/sh
 set -eu
 ROOT=/data/adb/f50-soft-router
+idle() {
+    for exe in /proc/[0-9]*/exe; do
+        target=$(readlink "$exe" 2>/dev/null || true)
+        case "$target" in "$ROOT/mihomo"|"$ROOT/tailscaled") return 1;; esac
+    done
+}
+if [ "${1:-}" = idle ]; then
+    idle && [ ! -e "$ROOT/active" ]
+    exit $?
+fi
 cd "$ROOT"
 [ "$(cat owner)" = f50-soft-router-v1 ] || exit 20
 umask 077
@@ -20,14 +30,7 @@ record() {
     sleep 1
     owned "$1" || exit 21
 }
-idle() {
-    for exe in /proc/[0-9]*/exe; do
-        target=$(readlink "$exe" 2>/dev/null || true)
-        case "$target" in "$ROOT/mihomo"|"$ROOT/tailscaled") return 1;; esac
-    done
-}
 case "${1:-}" in
-idle) idle && [ ! -e active ] ;;
 start)
     [ ! -e active ] || exit 22
     for name in mihomo tailscaled; do
@@ -59,8 +62,6 @@ stop)
                 [ "$count" -lt 15 ] || exit 26
                 sleep 1
             done
-        else
-            code=$?; [ "$code" = 1 ] || exit 23
         fi
     done
     idle || exit 27

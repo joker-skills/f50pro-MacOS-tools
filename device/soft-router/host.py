@@ -16,6 +16,10 @@ ROOT = "/data/adb/f50-soft-router"
 HERE = Path(__file__).resolve().parent
 
 
+class OperationError(ValueError, RuntimeError):
+    """A diagnostic written here, never a device/config/OS exception payload."""
+
+
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -25,11 +29,11 @@ def configuration(path):
     allowed = {"proxies", "proxy-groups", "rules", "mixed-port", "bind-address",
                "allow-lan", "mode", "log-level", "ipv6", "tun", "dns", "interface-name"}
     if not isinstance(source, dict) or set(source) - allowed:
-        raise ValueError("Only explicit proxy configuration is supported")
+        raise OperationError("Only explicit proxy configuration is supported")
     if not source.get("proxies") or not source.get("rules"):
-        raise ValueError("At least one proxy and routing rule are required")
+        raise OperationError("At least one proxy and routing rule are required")
     if any(not rule.startswith("MATCH,") for rule in source["rules"]):
-        raise ValueError("Stage 1 supports MATCH rules only")
+        raise OperationError("Stage 1 supports MATCH rules only")
     return {**source, "mixed-port": 17890, "bind-address": "127.0.0.1",
             "allow-lan": False, "mode": "rule", "log-level": "warning",
             "ipv6": False, "interface-name": "sipa_eth8",
@@ -49,12 +53,12 @@ class Device:
         result = self.shell(script, data=data)
         if result.returncode:
             # Device stderr may include subscription contents: do not print it.
-            raise RuntimeError(f"Device operation failed (exit {result.returncode})")
+            raise OperationError(f"Device operation failed (exit {result.returncode})")
         return result.stdout
 
     def put(self, name, data, executable=False):
         if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
-            raise ValueError("Invalid destination")
+            raise OperationError("Invalid destination")
         self.require(f"umask 077; cat > {ROOT}/{name}; chmod "
                      f"{'700' if executable else '600'} {ROOT}/{name}", data=data)
 
@@ -71,31 +75,33 @@ def private_write(path, data):
 
 def apply(args, device):
     if not re.fullmatch(r"[0-9a-f]{40}", args.source_oid or ""):
-        raise ValueError("A full source commit OID is required")
+        raise OperationError("A full source commit OID is required")
     assets = Path(args.assets_dir)
     pins = json.loads((HERE / "artifacts.json").read_text())
     actual = {name: digest(assets / name) for name in pins["sha256"]}
     if actual != pins["sha256"]:
-        raise ValueError("Asset SHA256 does not match pinned official release")
+        raise OperationError("Asset SHA256 does not match pinned official release")
     config = json.dumps(configuration(Path(args.private_config))).encode()
     state = Path(args.state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state, 0o700)
     if (state / "deployment.json").exists():
-        raise ValueError("State directory already used; check or restore before a new trial")
+        raise OperationError("State directory already used; check or restore before a new trial")
     exists = device.require(f"if [ -e {ROOT} ]; then echo exists; else echo absent; fi").strip()
     if exists == b"exists":
         device.require(f"[ ! -L {ROOT} ] && [ \"$(cat {ROOT}/owner)\" = f50-soft-router-v1 ]")
         if device.service("check").returncode != 10:
-            raise ValueError("Existing deployment is not verifiably stopped")
+            raise OperationError("Existing deployment is not verifiably stopped")
     elif exists != b"absent":
-        raise RuntimeError("Unknown device directory state")
+        raise OperationError("Unknown device directory state")
     record = {"serial": args.serial, "source_oid": args.source_oid,
               "sha256": actual, "config_sha256": hashlib.sha256(config).hexdigest(),
               "service_sha256": digest(HERE / "service.sh"),
               "baseline": "stopped", "directory_existed": exists == b"exists"}
     private_write(state / "deployment.json", record)
-    device.require(f"umask 077; mkdir -p {ROOT}; chmod 700 {ROOT}")
+    if exists == b"absent":
+        device.require(f"umask 077; mkdir {ROOT}")
+    device.require(f"chmod 700 {ROOT}")
     device.put("owner", b"f50-soft-router-v1\n")
     device.put("deployment.json", json.dumps(record).encode())
     device.put("service.sh", (HERE / "service.sh").read_bytes(), executable=True)
@@ -106,7 +112,7 @@ def apply(args, device):
     result = device.service("start")
     if result.returncode:
         device.service("stop")
-        raise RuntimeError("Start incomplete; use check then restore, do not replay apply")
+        raise OperationError("Start incomplete; use check then restore, do not replay apply")
     return check(args, device)
 
 
@@ -135,11 +141,31 @@ def check(args, device):
         got = device.require(f"sha256sum {ROOT}/{shlex.quote(name)}").decode().split()[0]
         if got != sha:
             return 20
+    tailscale_status(device)
+    return 0
+
+
+def recover_partial(device, record):
+    if device.service("idle").returncode != 0:
+        raise OperationError("Incomplete manifest and non-idle deployment")
+    if device.shell(f"[ ! -e {ROOT} ] && [ ! -L {ROOT} ]").returncode == 0:
+        return
+    device.require(f"[ -d {ROOT} ] && [ ! -L {ROOT} ]")
+    if device.shell(f'[ "$(cat {ROOT}/owner)" = f50-soft-router-v1 ]').returncode == 0:
+        return
+    if record["directory_existed"]:
+        raise OperationError("Partial directory ownership cannot be confirmed")
+    # Baseline was absent; rmdir only removes an empty upload directory, never data.
+    device.require(f"rmdir {ROOT}")
+
+
+def tailscale_status(device):
     response = device.shell(f"{ROOT}/tailscale --socket={ROOT}/tailscaled.sock status --json")
     status = json.loads(response.stdout)
-    if status.get("BackendState") not in {"NeedsLogin", "Running", "NeedsMachineAuth", "Stopped"}:
-        return 20
-    return 0
+    if not isinstance(status, dict) or status.get("BackendState") not in {
+            "NeedsLogin", "Running", "NeedsMachineAuth", "Stopped"}:
+        raise OperationError("Tailscale returned no recognized backend state")
+    return status
 
 
 def main():
@@ -165,43 +191,43 @@ def main():
         elif args.command in ("restore", "restore-check"):
             record = json.loads((Path(args.state_dir) / "deployment.json").read_text())
             if record["serial"] != args.serial or record["source_oid"] != args.source_oid:
-                raise ValueError("Restore target differs from saved baseline")
+                raise OperationError("Restore target differs from saved baseline")
             response = device.shell(f"cat {ROOT}/deployment.json")
             try:
                 remote = json.loads(response.stdout)
             except ValueError:
                 # An interrupted initial upload cannot have launched services yet.
                 # Confirm directly, without executing any partial device script.
-                if device.service("idle").returncode != 0:
-                    raise RuntimeError("Incomplete manifest and non-idle deployment")
+                recover_partial(device, record)
                 print(json.dumps({"command": args.command, "exit": 0, "state": "idle-partial-upload"}))
                 return 0
             if remote != record:
-                raise ValueError("Refusing to restore a different deployment")
+                raise OperationError("Refusing to restore a different deployment")
             if args.command == "restore":
                 if device.service("stop").returncode:
-                    raise RuntimeError("Stop incomplete; inspect before retry")
+                    raise OperationError("Stop incomplete; inspect before retry")
             result = 0 if check(args, device) == 10 else 20
         else:
             if check(args, device) != 0:
-                raise RuntimeError("Deployment is not healthy")
+                raise OperationError("Deployment is not healthy")
             base = f"{ROOT}/tailscale --socket={ROOT}/tailscaled.sock "
             if args.command == "login":
                 response = device.shell(base + "up --accept-dns=false --accept-routes=false --shields-up --timeout=20s")
                 output = (response.stdout + response.stderr).decode()
                 urls = re.findall(r"https://login\.tailscale\.com/[A-Za-z0-9/_-]+", output)
                 if response.returncode and not urls:
-                    raise RuntimeError("Login failed without authentication URL")
+                    raise OperationError("Login failed without authentication URL")
                 print("\n".join(urls) if urls else "No login URL returned; inspect ts-status")
             else:
-                status = json.loads(device.require(base + "status --json"))
+                status = tailscale_status(device)
                 print(json.dumps({"BackendState": status.get("BackendState"),
                                   "TailscaleIPs": status.get("TailscaleIPs", [])}))
             result = 0
         print(json.dumps({"command": args.command, "exit": result}))
         return result
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError) as exc:
-        print(f"soft-router: {type(exc).__name__}: operation incomplete; no automatic replay", file=sys.stderr)
+        detail = str(exc) if isinstance(exc, OperationError) else type(exc).__name__
+        print(f"soft-router: {detail}; operation incomplete; no automatic replay", file=sys.stderr)
         return 20
     finally:
         if lock is not None:
