@@ -47,12 +47,12 @@ start)
         if owned "$name"; then exit 22; else code=$?; [ "$code" = 1 ] || exit 23; fi
     done
     touch active
-    if [ "$(cat mode)" = transparent ]; then sh "$ROOT/network.sh" prepare; fi
+    if [ "$(cat mode)" = transparent ]; then /system/bin/sh "$ROOT/network.sh" prepare; fi
     (exec 9>&-; trap '' HUP; exec "$ROOT/mihomo" -d "$ROOT" -f "$ROOT/config.json") >mihomo.log 2>&1 </dev/null &
     record mihomo $!
     (exec 9>&-; trap '' HUP; exec "$ROOT/tailscaled" --tun=userspace-networking --socket="$ROOT/tailscaled.sock" --state="$ROOT/tailscale.state") >tailscaled.log 2>&1 </dev/null &
     record tailscaled $!
-    if [ "$(cat mode)" = transparent ]; then sh "$ROOT/network.sh" enable; fi
+    if [ "$(cat mode)" = transparent ]; then /system/bin/sh "$ROOT/network.sh" enable; fi
     ;;
 check)
     if [ ! -e active ]; then
@@ -63,10 +63,10 @@ check)
         exit 10
     fi
     owned mihomo && owned tailscaled || exit 25
-    if [ "$(cat mode)" = transparent ]; then sh "$ROOT/network.sh" check; fi
+    if [ "$(cat mode)" = transparent ]; then /system/bin/sh "$ROOT/network.sh" check; fi
     ;;
 stop)
-    if [ -f network-owned ]; then sh "$ROOT/network.sh" unhook; fi
+    if [ -f network-owned ]; then /system/bin/sh "$ROOT/network.sh" unhook; fi
     for name in mihomo tailscaled; do
         if owned "$name"; then
             kill "$pid"
@@ -79,7 +79,7 @@ stop)
         fi
     done
     idle || exit 27
-    if [ -f network-owned ]; then sh "$ROOT/network.sh" cleanup; fi
+    if [ -f network-owned ]; then /system/bin/sh "$ROOT/network.sh" cleanup; fi
     rm -f active mihomo.pid tailscaled.pid
     ;;
 *) exit 2;;

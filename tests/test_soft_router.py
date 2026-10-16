@@ -121,7 +121,14 @@ sys.exit(rc)
                 (root / name).symlink_to(kernel)
             script = (MODULE.parent / "network.sh").read_text().replace(
                 "ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
-            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"], "FAKE_KERNEL": str(root)}
+            script = script.replace("/system/bin/", str(root) + "/")
+            poisoned = root / "wrong-tools"
+            poisoned.mkdir()
+            for name in ("ip", "iptables", "ip6tables"):
+                tool = poisoned / name
+                tool.write_text("#!/bin/sh\nexit 99\n")
+                tool.chmod(0o700)
+            env = {**os.environ, "PATH": str(poisoned) + os.pathsep + os.environ["PATH"], "FAKE_KERNEL": str(root)}
             for action in ("prepare", "enable", "check", "cleanup", "cleanup"):
                 result = subprocess.run(["sh", "-c", script, "--", action], env=env, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr.decode())
@@ -143,6 +150,16 @@ sys.exit(rc)
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_network_tools_are_pinned_outside_magisk_standalone(self):
+        network = (MODULE.parent / "network.sh").read_text()
+        self.assertNotRegex(network, r"(?<![/\w])ip\s+-")
+        self.assertNotIn("xt=iptables", network)
+        self.assertNotIn("xt=ip6tables", network)
+        for executable in ("ip", "iptables", "ip6tables"):
+            self.assertIn("/system/bin/" + executable, network)
+        service = (MODULE.parent / "service.sh").read_text()
+        self.assertEqual(service.count('/system/bin/sh "$ROOT/network.sh"'), 5)
+
     def test_boot_requires_enable_marker_and_runs_single_start(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -153,6 +170,7 @@ class LifecycleTest(unittest.TestCase):
             (root / "service.sh").write_text('echo "$1" >> "' + str(root / "actions") + '"\n')
             script = (MODULE.parent / "boot.sh").read_text().replace(
                 "ROOT=/data/adb/f50-soft-router", f"ROOT={root}")
+            script = script.replace("/system/bin/", str(root) + "/")
             script = script.replace("/data/adb/magisk/busybox ash", "sh")
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]}
             self.assertEqual(subprocess.run(["sh", "-c", script], env=env).returncode, 1)
