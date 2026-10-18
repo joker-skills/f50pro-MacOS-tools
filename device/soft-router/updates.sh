@@ -123,13 +123,18 @@ cron_owned() {
 }
 schedule() {
     [ -f updates.enabled ] || return 0
-    mkdir -p cron
-    printf '%s\n' "$CRON_LINE" > cron/root.new
-    if ! cmp -s cron/root.new cron/root; then mv cron/root.new cron/root; else rm cron/root.new; fi
-    if cron_owned; then return 0; else code=$?; [ "$code" = 1 ] || return 1; fi
+    mkdir -p cron || return 1
+    printf '%s\n' "$CRON_LINE" > cron/root.new || return 1
+    if ! cmp -s cron/root.new cron/root; then
+        mv cron/root.new cron/root || return 1
+    else rm cron/root.new || return 1
+    fi
+    if cron_owned; then return 0; fi
+    # A reboot/reused PID leaves a stale record, never authority to signal that PID.
+    rm -f updates-crond.pid || return 1
     (exec 9>&-; exec "$BB" crond -f -c "$ROOT/cron") > updates-crond.log 2>&1 </dev/null &
     cron_pid=$!
-    echo "$cron_pid $(awk '{print $22}' /proc/$cron_pid/stat)" > updates-crond.pid
+    echo "$cron_pid $(awk '{print $22}' /proc/$cron_pid/stat)" > updates-crond.pid || return 1
     sleep 1
     cron_owned
 }
@@ -140,7 +145,6 @@ unschedule() {
         while [ -r "/proc/$cron_pid/stat" ] && [ "$(awk '{print $22}' /proc/$cron_pid/stat)" = "$cron_birth" ]; do
             i=$((i+1)); [ "$i" -lt 10 ] || return 1; sleep 1
         done
-    else code=$?; [ "$code" = 1 ] || return 1
     fi
     rm -f updates-crond.pid
 }
@@ -231,7 +235,7 @@ resume_updates() {
     i=0
     until verify_loaded runtime.json; do i=$((i+1)); [ "$i" -lt 15 ] || return 20; sleep 1; done
     attempt=$(status_value last_attempt)
-    confirm_status "$(status_value result)"
+    confirm_status "$(status_value result)" || return 20
     schedule
 }
 updates_install() {
@@ -281,9 +285,13 @@ updates_install() {
     schedule || return 20
 }
 restore_baseline_files() {
-    for name in config.json runtime.json service.sh boot.sh deployment.json; do
+    for name in config.json service.sh boot.sh deployment.json; do
         cp -p "updates.backup/$name" "$name.new" && mv "$name.new" "$name" || return 1
     done
+    interface=$(uplink) || return 1
+    render "$interface" updates.backup/config.json > runtime.json.new || return 1
+    "$ROOT/mihomo" -t -d "$ROOT" -f "$ROOT/runtime.json.new" >/dev/null 2>&1 || return 1
+    mv runtime.json.new runtime.json || return 1
     if [ -f updates.backup/boot-entry ]; then
         cp -p updates.backup/boot-entry "$BOOT.new" && mv "$BOOT.new" "$BOOT" || return 1
     fi
@@ -308,6 +316,7 @@ updates_remove() {
     fi
     identity=$(identities) || return 20
     unschedule || return 20
+    printf '%s\n' "$identity" > updates.pending
     # Even a failed HUP bootstrap must leave the original files on disk. Retain the
     # backup/pending marker when process-side verification cannot finish.
     trap restore_baseline_files EXIT
@@ -315,23 +324,38 @@ updates_remove() {
     # First verify the original policy through the private controller, then remove it.
     # This also recovers a bootstrap failure that never created the socket.
     awk 'NR == 1 {print; print "  \"external-controller-unix\": \"/data/adb/f50-soft-router/controller.sock\","; next} {print}' \
-        updates.backup/runtime.json > runtime.json.new
+        runtime.json > runtime.json.new
     "$ROOT/mihomo" -t -d "$ROOT" -f "$ROOT/runtime.json.new" >/dev/null 2>&1 || return 20
     mv runtime.json.new runtime.json
     same_processes || return 20
     owned mihomo && kill -HUP "$pid" || return 20
     i=0
     until verify_loaded runtime.json; do i=$((i+1)); [ "$i" -lt 15 ] || return 20; sleep 1; done
-    cp updates.backup/config.json config.json.new; mv config.json.new config.json
-    cp updates.backup/runtime.json runtime.json.new; mv runtime.json.new runtime.json
+    restore_baseline_files || return 20
     same_processes || return 20
     owned mihomo && kill -HUP "$pid" || return 20
     i=0
     while api version >/dev/null 2>&1; do i=$((i+1)); [ "$i" -lt 15 ] || return 20; sleep 1; done
     sleep 1
     same_processes || return 20
-    for name in service.sh boot.sh deployment.json; do cp -p "updates.backup/$name" "$name.new"; mv "$name.new" "$name"; done
-    if [ -f updates.backup/boot-entry ]; then cp -p updates.backup/boot-entry "$BOOT.new"; mv "$BOOT.new" "$BOOT"; fi
     trap - EXIT
+    # Host checks the restored baseline before releasing recovery material.
+}
+updates_finalize() {
+    private_root || return 20
+    if [ ! -e updates.backup ]; then
+        if updates_check; then return 20; else code=$?; [ "$code" = 10 ]; return; fi
+    fi
+    identity=$(identities) || return 20
+    [ "$identity" = "$(cat updates.pending)" ] || return 20
+    for name in config.json service.sh boot.sh deployment.json; do
+        cmp -s "updates.backup/$name" "$name" || return 20
+    done
+    if [ -f updates.backup/boot-entry ]; then cmp -s updates.backup/boot-entry "$BOOT" || return 20; fi
+    interface=$(uplink) || return 20
+    render "$interface" updates.backup/config.json > runtime.json.new || return 20
+    cmp -s runtime.json.new runtime.json || return 20
+    rm runtime.json.new
+    if api version >/dev/null 2>&1; then return 20; fi
     cleanup_updates
 }

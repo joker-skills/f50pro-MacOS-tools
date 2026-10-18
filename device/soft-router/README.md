@@ -27,6 +27,7 @@ apply 可选 `--transparent --autostart` 和 `--geo-assets-dir <本机缓存目�
 - `check`：0 表示本次版本进程与摘要一致；10 表示未运行；20 表示未知或不健康。
   同时只读重选当前蜂窝口，按同一渲染计算期望摘要并比对运行配置；不会改配置或重启。
   透明模式还检查本模块的双栈规则和 hook，自启模式校验自启文件。
+  更新启用后若传 state-dir，须使用 updates-install 的目录；传 apply 目录会明确报错。
   **这不代替真实 USB/热点客户端的 DNS、IPv4/IPv6 HTTPS 和 UDP 业务探针。**
 - `restore` / `restore-check`：移除本次自启入口、精确撤销本模块规则、停止进程并核验停止态。保留软件和 Tailscale
   身份，既不注销账号也不调用仓库的固件恢复工具。不得拿它恢复原先运行的其它服务。
@@ -113,8 +114,11 @@ symlink，不接受任意上传路径；忽略其它文件。允许名单与 And
   template/runtime 摘要检查配置，不再硬比首次配置摘要。
 - `updates-remove --source-oid <安装时 OID> --state-dir <安装时目录>`：
   仅停止通过 PID、exe、starttime、完整 cmdline 确认归属的本模块 crond。
-  在原进程上先回读原策略，再移除 Unix 控制器并恢复原脚本、manifest、配置和 boot 入口，
+  用备份配置模板和当前唯一有效蜂窝口重渲染 runtime，在原进程上先回读原策略，
+  再移除 Unix 控制器并恢复原脚本、manifest、配置和 boot 入口，
   不调用 stop/start/apply/restore。移除后 updates-check 返回 10，可重复执行。
+  宿主核实原文件、当前接口 runtime 和原进程后，才调用内部 finalize 清理设备备份；
+  核验中断时保留备份和 pending，可重复同一 remove 完成恢复。
   本机 state-dir 只有成功恢复且重新核实原态后才允许同候选再次试验；未知恢复材料不会被覆盖。
 
 设备定时任务独占自己的 `cron/root`，不覆盖系统 crontab，正式唯一行如下：
@@ -139,9 +143,16 @@ symlink，不接受任意上传路径；忽略其它文件。允许名单与 And
 无凭证的 `update.status` 含 last_attempt、last_success、reload_count、config_sha256、result，
 并记录已确认的 runtime_sha256。changed 成功才增加 reload_count，unchanged 仅推进检查成功时间。
 成功的 boot/start 路径幂等恢复本模块调度；新启动会验证已确认模板和运行规则后刷新 runtime 摘要。
+重启遗留或被其它进程复用的 crond PID 记录会被丢弃并重新调度，绝不向未识别的 PID 发信号。
+代理和 Tailscale 启动成功后的更新恢复失败返回 28，boot 不会因此停止代理；
+pending、回读或调度故障仍由 updates-check 返回非零报告。
 手动停服务后，cron 不会拉起代理；没有增加看门狗。运行中换接口仍需既有停止/启动入口。
 完整国内/国外出口、反套娃、真实 DNS/UDP/IPv6、原 PID HUP 和长连接保持必须由独立实机探针确认，
 本地单测不代表这些验收已经完成。
+
+单测依赖中心 `proxy-config` 的 `bbf3c070` 版 `render/f50.py`，按文件 SHA256 校验，
+不会复制适配器实现。默认查找正式 checkout；其它位置用 `F50_PROXY_CONFIG_ROOT` 指定。
+缺少适配器或版本不匹配时测试明确失败，并提示所需版本和摘要。
 
 ## 透明代理与自启边界
 

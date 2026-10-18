@@ -309,7 +309,10 @@ def updates_check(args, device):
         if device.require(f"sha256sum {ROOT}/{name}").decode().split()[0] != expected:
             return 20
     if getattr(args, "state_dir", None):
-        saved = json.loads((Path(args.state_dir) / "updates.json").read_text())
+        journal = Path(args.state_dir) / "updates.json"
+        if not journal.is_file():
+            raise OperationError("Enabled updates require their install state directory (updates.json)")
+        saved = json.loads(journal.read_text())
         if saved["serial"] != args.serial or saved["deployment"] != record:
             return 20
     return 0
@@ -432,13 +435,16 @@ def updates_install(args, device):
 def verify_update_baseline(saved, state, device):
     for name, sha in saved["baseline_sha256"].items():
         path = BOOT if name == "boot-entry" else ROOT + "/" + name
-        if digest(state / name) != sha or device.require(f"sha256sum {path}").decode().split()[0] != sha:
+        # runtime is derived from the original template and the current cellular interface.
+        if digest(state / name) != sha or (name != "runtime.json" and
+                device.require(f"sha256sum {path}").decode().split()[0] != sha):
             raise OperationError("Baseline file restoration could not be verified")
     if "boot-entry" not in saved["baseline_sha256"]:
         device.require(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]")
     if device.require(f"cat {ROOT}/mihomo.pid {ROOT}/tailscaled.pid").decode() != saved["identity"]:
         raise OperationError("Original process identity changed")
-    if device.service("check").returncode:
+    # Validate runtime/network normally, excluding update health while retaining its backup.
+    if device.service("updates-restored-check").returncode:
         raise OperationError("Restored running baseline is unhealthy")
 
 
@@ -458,6 +464,8 @@ def updates_remove(args, device):
     if device.service("updates-remove").returncode:
         raise OperationError("Running update removal incomplete; keep recovery material")
     verify_update_baseline({**saved, "identity": restore_identity}, state, device)
+    if device.service("updates-finalize").returncode:
+        raise OperationError("Restored baseline verified but update cleanup incomplete; keep state")
     if device.service("updates-check").returncode != 10:
         raise OperationError("Updates absence is not confirmed")
     saved["phase"] = "restored"

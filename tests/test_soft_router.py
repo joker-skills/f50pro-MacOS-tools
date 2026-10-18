@@ -1,5 +1,6 @@
 import importlib.util
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -14,6 +15,24 @@ MODULE = Path(__file__).resolve().parents[1] / "device/soft-router/host.py"
 spec = importlib.util.spec_from_file_location("soft_router_host", MODULE)
 host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
+
+
+def setUpModule():
+    global adapter_environment
+    root = Path(os.environ.get("F50_PROXY_CONFIG_ROOT", str(
+        Path(os.environ.get("JOKER_REPOS", str(Path.home() / "repos"))) / "proxy-config")))
+    helper = root / "render/f50.py"
+    expected = "faebc31fd41be0922f670fb8a85a86de3a9ebfc0580d11a5285ac7d85bf877ac"
+    if not helper.is_file() or hashlib.sha256(helper.read_bytes()).hexdigest() != expected:
+        raise RuntimeError("Tests require render/f50.py from proxy-config bbf3c070; "
+                           "set F50_PROXY_CONFIG_ROOT to that checkout (SHA256 " + expected + ")")
+    adapter_environment = patch.dict(os.environ, {"F50_PROXY_CONFIG_ROOT": str(root.resolve())})
+    adapter_environment.start()
+    print("F50 test adapter: proxy-config bbf3c070, SHA256 " + expected)
+
+
+def tearDownModule():
+    adapter_environment.stop()
 
 
 class LocalShellDevice(host.Device):
@@ -919,6 +938,9 @@ else: print('{}')
         result=self.run_service('updates-remove')
         self.assertEqual(result.returncode,0,result.stderr.decode())
         self.assertEqual(self.original,{n:(self.root/n).read_bytes() for n in self.original})
+        self.assertTrue((self.root/'updates.backup').exists())
+        self.assertEqual(self.run_service('updates-check').returncode,20)
+        self.assertEqual(self.run_service('updates-finalize').returncode,0)
         self.assertFalse((self.root/'updates.backup').exists())
         self.assertEqual(self.run_service('updates-check').returncode,10)
         self.assertEqual(self.run_service('updates-remove').returncode,0)
@@ -992,6 +1014,46 @@ else: print('{}')
         (proc/'stat').unlink()
         self.assertEqual(check(),1)
 
+    def test_stale_crond_record_can_reschedule_and_remove_without_signaling(self):
+        self.prepare()
+        helper = self.helper.replace('/data/adb/magisk/busybox', str(self.root / 'busybox'))
+        helper = helper.replace('cron_owned() {', 'record_owned() {')
+        self.tool('busybox', f'echo "$*" >> "{self.root}/spawned"\n')
+        proc = self.root / 'proc/93'
+        proc.mkdir()
+        (proc / 'stat').write_text(' '.join(['0'] * 21 + ['123']))
+        (proc / 'exe').symlink_to(self.root / 'busybox')
+        command = (str(self.root / 'busybox') + '\0crond\0-f\0-c\0' + str(self.root / 'cron') + '\0').encode()
+        (proc / 'cmdline').write_bytes(command)
+        (self.root / 'updates.enabled').touch()
+        # Only the newly spawned daemon's platform identity is simulated.
+        # Stale records run through the real executable/starttime/cmdline checks.
+        harness = f'cd {host.shlex.quote(str(self.root))}\nROOT={host.shlex.quote(str(self.root))}\n' + helper + '''
+cron_owned() {
+    [ -f updates-crond.pid ] || return 1
+    read cron_pid cron_birth < updates-crond.pid
+    if [ "$cron_pid" = 93 ]; then record_owned; else return 0; fi
+}
+awk() { if [ -f "$2" ]; then command awk "$@"; else echo 456; fi; }
+kill() { echo "$*" >> signals; return 1; }
+'''
+        for fault in ('executable', 'starttime', 'command'):
+            with self.subTest(fault=fault):
+                (proc / 'exe').unlink()
+                (proc / 'exe').symlink_to(self.root / ('unrelated' if fault == 'executable' else 'busybox'))
+                (proc / 'stat').write_text(' '.join(['0'] * 21 + ['999' if fault == 'starttime' else '123']))
+                (proc / 'cmdline').write_bytes(command.replace(b'\0-f\0', b'\0-b\0') if fault == 'command' else command)
+                (self.root / 'updates-crond.pid').write_text('93 123\n')
+                result = subprocess.run(['sh', '-ec', harness + '\nunschedule'], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertFalse((self.root / 'updates-crond.pid').exists())
+                (self.root / 'updates-crond.pid').write_text('93 123\n')
+                result = subprocess.run(['sh', '-ec', harness + '\nschedule'], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertNotEqual((self.root / 'updates-crond.pid').read_text().split()[0], '93')
+                self.assertFalse((self.root / 'signals').exists())
+        self.assertEqual((self.root / 'spawned').read_text().splitlines(), [f'crond -f -c {self.root}/cron'] * 3)
+
     def test_host_install_check_remove_repeat_and_failed_bootstrap(self):
         self.prepare()
         import shutil
@@ -1001,6 +1063,8 @@ else: print('{}')
         for n in ('service.sh','boot.sh','updates.sh','network.sh'):
             (source/n).write_bytes((MODULE.parent/n).read_bytes())
         (self.root/'network.sh').write_bytes((source/'network.sh').read_bytes())
+        # The original deployment may already ship the update-aware service script.
+        (self.root/'service.sh').write_bytes((source/'service.sh').read_bytes())
         self.tool('tailscale', '''echo '{"BackendState":"Running"}'\n''')
         self.tool('tailscaled','exit 0\n')
         pins={n:host.digest(self.root/n) for n in ('mihomo','tailscale','tailscaled')}
@@ -1048,6 +1112,11 @@ else: print('{}')
             self.assertEqual(host.updates_install(args,device),0)
             self.assertEqual(host.check(args,device),0)
             self.assertEqual(host.updates_check(args,device),0)
+            apply_state = self.root / 'apply-state'
+            apply_state.mkdir()
+            (apply_state / 'deployment.json').write_text(json.dumps(baseline))
+            with self.assertRaisesRegex(host.OperationError, 'install state directory'):
+                host.check(SimpleNamespace(**{**vars(args), 'state_dir': str(apply_state)}), device)
             record=json.loads((Path(args.state_dir)/'updates.json').read_text())
             self.assertNotIn('secret-token',json.dumps(record))
             staged_path = self.root / 'updates.stage/deployment.json'
@@ -1057,6 +1126,20 @@ else: print('{}')
                 host.updates_remove(args, device)
             self.assertTrue((self.root / 'updates.backup').exists())
             staged_path.write_bytes(staged_bytes)
+            # A legitimate restart on a different uplink changes the derived runtime.
+            (self.root / 'routes').write_text('')
+            (self.root / 'addresses').write_text('')
+            self.link('sipa_eth9')
+            for pid, name in ((91, 'mihomo'), (92, 'tailscaled')):
+                (self.root / f'proc/{pid}/stat').write_text(' '.join(['0'] * 21 + ['999']))
+                (self.root / f'{name}.pid').write_text(f'{pid} 999\n')
+            self.original['runtime.json'] = self.original['runtime.json'].replace(b'sipa_eth0', b'sipa_eth9')
+            with patch.object(host, 'verify_update_baseline', side_effect=host.OperationError('verification interrupted')):
+                with self.assertRaisesRegex(host.OperationError, 'verification interrupted'):
+                    host.updates_remove(args, device)
+            self.assertTrue((self.root / 'updates.backup').exists())
+            self.assertTrue((self.root / 'updates.pending').exists())
+            self.assertEqual((self.root / 'runtime.json').read_bytes(), self.original['runtime.json'])
             self.assertEqual(host.updates_remove(args,device),0)
             self.assertEqual(host.updates_check(args,device),10)
             self.assertEqual(host.updates_remove(args,device),0)
@@ -1106,12 +1189,70 @@ else: print('{}')
 
     def test_remove_uses_current_owned_identity_after_a_legitimate_start(self):
         self.installed()
+        (self.root / 'routes').write_text('')
+        (self.root / 'addresses').write_text('')
+        self.link('sipa_eth9')
         for pid, name in ((91, "mihomo"), (92, "tailscaled")):
             (self.root / f"proc/{pid}/stat").write_text(" ".join(["0"] * 21 + ["999"]))
             (self.root / f"{name}.pid").write_text(f"{pid} 999\n")
         result = self.run_service("updates-remove")
         self.assertEqual(result.returncode, 0, result.stderr.decode())
-        self.assertEqual(self.original, {n: (self.root / n).read_bytes() for n in self.original})
+        expected = {**self.original, 'runtime.json': self.original['runtime.json'].replace(b'sipa_eth0', b'sipa_eth9')}
+        self.assertEqual(expected, {n: (self.root / n).read_bytes() for n in expected})
+        self.assertEqual((self.root / 'loaded.json').read_bytes(), expected['runtime.json'])
+        self.assertTrue((self.root / 'updates.backup').exists())
+        (self.root / 'runtime.json').write_bytes(self.original['runtime.json'])
+        self.assertNotEqual(self.run_service('updates-finalize').returncode, 0)
+        self.assertTrue((self.root / 'updates.backup').exists())
+        (self.root / 'runtime.json').write_bytes(expected['runtime.json'])
+        self.assertEqual(self.run_service('updates-finalize').returncode, 0)
+
+    def test_boot_keeps_proxy_services_when_update_recovery_fails(self):
+        import shutil
+        self.installed()
+        initial_status = (self.root / 'update.status').read_bytes()
+        script = self.script
+        self.tool('tailscaled', 'exit 0\n')
+        self.tool('getprop', 'echo 1\n')
+        self.tool('boot-ip', "echo ' inet 192.168.0.1/24'\n")
+        (self.root / 'boot-enabled').touch()
+        boot = (MODULE.parent / 'boot.sh').read_text().replace(
+            'ROOT=/data/adb/f50-soft-router', f'ROOT={self.root}')
+        boot = boot.replace('/system/bin/getprop', str(self.root / 'getprop'))
+        boot = boot.replace('/system/bin/ip', str(self.root / 'boot-ip'))
+        boot = boot.replace('/data/adb/magisk/busybox ash', 'sh').replace('$ROOT/service.sh', '$ROOT/runner')
+        record = '''
+record() {
+    case "$1" in mihomo) pid=91;; tailscaled) pid=92;; esac
+    mkdir -p "$ROOT/proc/$pid"
+    ln -s "$ROOT/$1" "$ROOT/proc/$pid/exe"
+    awk 'BEGIN {for(i=1;i<=21;i++) printf "0 "; print 999}' > "$ROOT/proc/$pid/stat"
+    echo "$pid 999" > "$1.pid"
+    if [ "$1" = mihomo ]; then cp runtime.json loaded.json; fi
+}
+'''
+        for fault in ('pending', 'readback-timeout', 'status-mismatch', 'schedule-failed'):
+            with self.subTest(fault=fault):
+                for name in ('updates.pending', 'stale-rules', 'active', 'mihomo.pid', 'tailscaled.pid', 'actions'):
+                    (self.root / name).unlink(missing_ok=True)
+                shutil.rmtree(self.root / 'proc')
+                (self.root / 'update.status').write_bytes(initial_status)
+                if fault == 'pending':
+                    (self.root / 'updates.pending').touch()
+                elif fault == 'readback-timeout':
+                    (self.root / 'stale-rules').touch()
+                elif fault == 'status-mismatch':
+                    (self.root / 'update.status').write_bytes(initial_status.replace(b'config_sha256=', b'wrong_sha256='))
+                extra = record + ('\nschedule() { return 1; }\n' if fault == 'schedule-failed' else '')
+                runner = script.replace('action=${1:-}', extra + '\naction=${1:-}')
+                self.tool('runner', f'echo "$1" >> "{self.root}/actions"\n' + runner)
+                result = subprocess.run(['sh', '-c', boot], env=self.env, capture_output=True)
+                self.assertEqual(result.returncode, 28, result.stderr.decode())
+                self.assertEqual((self.root / 'actions').read_text().splitlines(), ['uplink', 'boot'])
+                self.assertTrue((self.root / 'active').exists())
+                self.assertEqual((self.root / 'mihomo.pid').read_text(), '91 999\n')
+                self.assertEqual((self.root / 'tailscaled.pid').read_text(), '92 999\n')
+                self.assertNotEqual(self.run_service('updates-check').returncode, 0)
 
 
 class UpdateArgumentsTest(unittest.TestCase):

@@ -71,6 +71,7 @@ if ! command -v updates_install >/dev/null 2>&1 && [ -f "$ROOT/updates.sh" ]; th
     . "$ROOT/updates.sh"
 fi
 action=${1:-}
+if [ "$action" = updates-restored-check ]; then action=check; fi
 if [ "$action" = boot ]; then
     [ -f boot-enabled ] || exit 0
     if owned mihomo && owned tailscaled; then
@@ -85,6 +86,7 @@ case "$action" in
 updates-install) updates_install;;
 updates-check) updates_check;;
 updates-remove) updates_remove;;
+updates-finalize) updates_finalize;;
 update) update_config;;
 start)
     [ ! -e active ] || exit 22
@@ -104,7 +106,9 @@ start)
     (exec 9>&-; trap '' HUP; exec "$ROOT/tailscaled" --tun=userspace-networking --socket="$ROOT/tailscaled.sock" --state="$ROOT/tailscale.state") >tailscaled.log 2>&1 </dev/null &
     record tailscaled $!
     if [ "$(cat mode)" = transparent ]; then /system/bin/sh "$ROOT/network.sh" enable; fi
-    if [ -f updates.enabled ]; then resume_updates; fi
+    if [ -f updates.enabled ]; then
+        resume_updates || { echo 'Update recovery failed; proxy services remain running' >&2; exit 28; }
+    fi
     ;;
 check)
     if [ ! -e active ]; then
@@ -115,7 +119,9 @@ check)
         exit 10
     fi
     owned mihomo && owned tailscaled || exit 25
-    if [ -f updates.enabled ] || [ -e updates.backup ]; then updates_check || exit 20; fi
+    if [ "${1:-}" != updates-restored-check ] && { [ -f updates.enabled ] || [ -e updates.backup ]; }; then
+        updates_check || exit 20
+    fi
     interface=$(uplink) || exit 29
     expected=$(render "$interface") || exit 29
     expected_sha=$(printf '%s\n' "$expected" | sha256sum) || exit 29
