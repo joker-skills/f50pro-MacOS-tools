@@ -699,5 +699,455 @@ fi
             '/data/adb/magisk/busybox ash "$ROOT/service.sh"'), 3)
 
 
+class UpdateServiceTest(unittest.TestCase):
+    setUp = CellularInterfaceTest.setUp
+    tool = CellularInterfaceTest.tool
+    link = CellularInterfaceTest.link
+    running = CellularInterfaceTest.running
+
+    def prepare(self):
+        self.link("sipa_eth0")
+        self.running("sipa_eth0")
+        self.boot = self.root / "boot-entry"
+        self.boot.write_text("original boot\n")
+        self.original = {n: (self.root / n).read_bytes() for n in ("config.json", "runtime.json")}
+        for name in ("service.sh", "boot.sh", "deployment.json"):
+            (self.root / name).write_text("original " + name)
+        (self.root / "loaded.json").write_bytes(self.original["runtime.json"])
+        self.helper = (MODULE.parent / "updates.sh").read_text().replace(
+            "BOOT=/data/adb/service.d/f50-soft-router.sh", f"BOOT={self.boot}")
+        self.helper = self.helper.replace("/proc/", f"{self.root}/proc/")
+        self.helper = self.helper.replace("sha256sum", "shasum -a 256")
+        self.helper = self.helper.replace("$(stat -c %u:%a subscription.curl)", "0:600")
+        self.script = self.script.replace("# UPDATE_FUNCTIONS", self.helper + f'''
+private_root() {{ return 0; }}
+schedule() {{ echo schedule >> "{self.root}/schedules"; }}
+unschedule() {{ echo unschedule >> "{self.root}/schedules"; }}
+sleep() {{ :; }}
+kill() {{
+    echo "$*" >> "{self.root}/signals"
+    [ ! -e "{self.root}/hup-fails" ] || return 1
+    cp "{self.root}/runtime.json" "{self.root}/loaded.json"
+}}
+''')
+        self.tool("mihomo", f'''exec {host.shlex.quote(host.sys.executable)} -c '
+import json,sys
+c=json.load(open(sys.argv[-1]))
+assert not any("missing-target" in r for r in c["rules"])
+' "$@"
+''')
+        self.tool("curl", "exec " + host.shlex.quote(host.sys.executable) + " " +
+                  host.shlex.quote(str(self.root / "fake-curl.py")) + ' "$@"\n')
+        (self.root / "fake-curl.py").write_text('''import json,sys,pathlib,shutil
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+with (root/'curl-calls').open('a') as f: f.write(' '.join(a)+'\\n')
+if '--config' in a:
+ if (root/'download-fails').exists():
+  print('HTTP 404: private-token',file=sys.stderr);sys.exit(22)
+ shutil.copyfile(root/'next.json',root/a[a.index('--output')+1]);sys.exit(0)
+if '-X' in a:
+ shutil.copyfile(root/'runtime.json',root/'loaded.json')
+ if (root/'reload-timeout').exists(): sys.exit(28)
+ print('204',end='');sys.exit(0)
+c=json.loads((root/'loaded.json').read_text())
+if 'external-controller-unix' not in c: sys.exit(7)
+endpoint=a[-1].split('/')[-1]
+if endpoint=='rules':
+ rows=[]
+ for r in c['rules']:
+  p=r.split(',');t=p[0].replace('-','');payload=p[1] if len(p)>2 else ''
+  rows.append(dict(index=len(rows),type=t,payload=payload.lower() if t=='GEOIP' else payload,
+                   proxy=p[2] if len(p)>2 else p[1],size=-1,
+                   extra=dict(disabled=False,hitCount=0)))
+ if (root/'stale-rules').exists(): rows=[]
+ print(json.dumps(dict(rules=rows),ensure_ascii=False,separators=(',',':')))
+elif endpoint=='group':
+ names=['GLOBAL']+[g['name'] for g in c.get('proxy-groups',[])]
+ if (root/'stale-groups').exists(): names.append('obsolete-group')
+ print(json.dumps(dict(proxies=[dict(name=n) for n in names]),ensure_ascii=False,separators=(',',':')))
+elif endpoint=='proxies':
+ print(json.dumps(dict(proxies={g['name']:dict(type='Selector') for g in c.get('proxy-groups',[])}),ensure_ascii=False,separators=(',',':')))
+else: print('{}')
+''')
+        self.env = {**os.environ, "PATH": str(self.root) + os.pathsep + os.environ["PATH"]}
+        stage = self.root / "updates.stage"
+        stage.mkdir()
+        for name in ("service.sh", "boot.sh", "updates.sh", "deployment.json"):
+            (stage / name).write_text("candidate " + name)
+        cfg = {**self.config, "external-controller-unix": host.ROOT + "/controller.sock"}
+        (stage / "config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2)+'\n')
+        (stage / "subscription.curl").write_text('url = "https://private.invalid/token"\n')
+        (stage / "boot-present").write_text("yes\n")
+        (stage / "identity").write_text('91 123\n92 123\n')
+        (stage / "baseline.sha").write_text(''.join(
+            host.digest(self.root/n)+'  '+str(self.root/n)+'\n' for n in
+            ("config.json", "runtime.json", "service.sh", "boot.sh", "deployment.json")))
+        self.next_config(cfg)
+        return cfg
+
+    def run_service(self, action):
+        return subprocess.run(["sh", "-c", self.script, "--", action], env=self.env, capture_output=True)
+
+    def installed(self):
+        cfg = self.prepare()
+        result = self.run_service("updates-install")
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        # Helper sourcing is bypassed by the same inline functions on every invocation.
+        return cfg
+
+    def next_config(self, cfg):
+        (self.root / "next.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2)+'\n')
+
+    def status(self):
+        return dict(line.split('=',1) for line in (self.root / "update.status").read_text().splitlines())
+
+    def test_install_preflight_failure_preserves_running_files_and_never_signals(self):
+        cfg = self.prepare()
+        paths = [self.root / name for name in (*host.UPDATE_FILES, "mihomo.pid", "tailscaled.pid", "loaded.json")]
+        paths.append(self.boot)
+        def running_state():
+            return {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_mode)
+                    for p in paths}
+        baseline = running_state()
+        failures = {
+            "404": None,
+            "empty": b"",
+            "truncated": b'{"rules": [',
+            "oversize": b" " * (4194304 + 1),
+            "changed-ingress": json.dumps({**cfg, "mixed-port": 1080}, indent=2).encode(),
+            "invalid-core-config": json.dumps({**cfg, "rules": ["MATCH,missing-target"]}, indent=2).encode(),
+        }
+        for fault, content in failures.items():
+            with self.subTest(fault=fault):
+                marker = self.root / "download-fails"
+                if content is None:
+                    marker.touch()
+                else:
+                    (self.root / "next.json").write_bytes(content)
+                result = self.run_service("updates-install")
+                marker.unlink(missing_ok=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b"private-token", result.stdout + result.stderr)
+                self.assertEqual(running_state(), baseline)
+                for name in ("updates.backup", "updates.backup.new", "updates.enabled", "updates.pending",
+                             "subscription.curl", "update.status", "signals", "schedules", "cron",
+                             "updates.download", "updates.runtime", "updates.envelope", "updates.envelope.raw"):
+                    self.assertFalse((self.root / name).exists(), name)
+        calls = (self.root / "curl-calls").read_text()
+        self.assertIn("--config updates.stage/subscription.curl", calls)
+        self.assertIn("--proto =https --proto-redir =https", calls)
+        self.assertIn("--proxy http://127.0.0.1:17890", calls)
+        self.assertNotIn("-X PUT", calls)
+
+    def test_install_validates_new_center_config_but_keeps_current_policy(self):
+        cfg = self.prepare()
+        cfg["rules"] = ["DOMAIN,preflight-only.invalid,DIRECT", *cfg["rules"]]
+        cfg["proxy-groups"] = [{"name": "preflight-only", "type": "select", "proxies": ["DIRECT"]}]
+        self.next_config(cfg)
+        result = self.run_service("updates-install")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        template = json.loads((self.root / "config.json").read_text())
+        runtime = json.loads((self.root / "loaded.json").read_text())
+        for value in (template, runtime):
+            self.assertEqual(value["rules"], self.config["rules"])
+            self.assertNotIn("proxy-groups", value)
+        self.assertEqual(self.status()["reload_count"], "0")
+        self.assertEqual((self.root / "signals").read_text().splitlines(), ["-HUP 91"])
+        self.assertEqual((self.root / "schedules").read_text().splitlines(), ["schedule"])
+        self.assertFalse((self.root / "updates.download").exists())
+        self.assertFalse((self.root / "updates.runtime").exists())
+
+    def test_changed_unchanged_invalid_and_download_failures(self):
+        cfg = self.installed()
+        self.next_config(cfg)
+        self.assertEqual(self.run_service("update").returncode,0)
+        before = {n: ((self.root/n).stat().st_ino,(self.root/n).read_bytes()) for n in self.original}
+        self.assertEqual(self.status()["result"],"unchanged")
+        self.assertEqual(self.status()["reload_count"],"0")
+        self.assertEqual(before,{n: ((self.root/n).stat().st_ino,(self.root/n).read_bytes()) for n in self.original})
+        cfg['rules'].insert(0,'DOMAIN,new.invalid,DIRECT')
+        cfg['proxy-groups']=[dict(name='new.invalid',type='select',proxies=['DIRECT'])]
+        self.next_config(cfg)
+        self.assertEqual(self.run_service("update").returncode,0)
+        self.assertEqual(self.status()["result"],"changed")
+        self.assertEqual(self.status()["reload_count"],"1")
+        stable = {n:(self.root/n).read_bytes() for n in self.original}
+        cfg['rules'][0]='DOMAIN,new.invalid,missing-target'
+        self.next_config(cfg)
+        self.assertNotEqual(self.run_service("update").returncode,0)
+        self.assertEqual(self.status()["result"],"invalid")
+        (self.root/'download-fails').touch()
+        self.assertNotEqual(self.run_service("update").returncode,0)
+        self.assertEqual(self.status()["result"],"download-failed")
+        self.assertEqual(stable,{n:(self.root/n).read_bytes() for n in self.original})
+        self.assertFalse((self.root/'updates.pending').exists())
+        (self.root/'active').unlink()
+        calls=(self.root/'curl-calls').read_bytes()
+        self.assertNotEqual(self.run_service("update").returncode,0)
+        self.assertEqual(calls,(self.root/'curl-calls').read_bytes())
+
+    def test_rejects_ingress_format_and_duplicate_fields_before_reload(self):
+        cfg = self.installed()
+        baseline = {n:(self.root/n).read_bytes() for n in self.original}
+        for changed in ({**cfg,'external-controller':'0.0.0.0:9090'},
+                        {**cfg,'mixed-port':1080}, {**cfg,'tun':{'enable':True}},
+                        {**cfg,'dns':{**cfg['dns'],'listen':'0.0.0.0:53'}},
+                        {**cfg,'interface-name':'sipa_eth9'}):
+            self.next_config(changed)
+            self.assertNotEqual(self.run_service('update').returncode,0)
+        for text in (json.dumps(cfg),json.dumps(cfg,indent=2).replace(
+                '"mixed-port": 17890,','"mixed-port": 17890,\n  "mixed-port": 17890,')):
+            (self.root/'next.json').write_text(text)
+            self.assertNotEqual(self.run_service('update').returncode,0)
+        self.assertEqual(baseline,{n:(self.root/n).read_bytes() for n in self.original})
+        self.assertNotIn('-X PUT',(self.root/'curl-calls').read_text())
+
+    def test_unknown_reload_blocks_next_attempt_and_removal_restores_baseline(self):
+        cfg=self.installed()
+        cfg['rules'].insert(0,'DOMAIN,new.invalid,DIRECT')
+        self.next_config(cfg)
+        (self.root/'reload-timeout').touch()
+        self.assertNotEqual(self.run_service('update').returncode,0)
+        self.assertTrue((self.root/'updates.pending').exists())
+        self.assertEqual(self.status()['result'],'reload-unknown')
+        self.assertEqual(self.status()['reload_count'],'0')
+        calls=(self.root/'curl-calls').read_bytes()
+        self.assertNotEqual(self.run_service('update').returncode,0)
+        self.assertEqual(calls,(self.root/'curl-calls').read_bytes())
+        (self.root/'reload-timeout').unlink()
+        result=self.run_service('updates-remove')
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertEqual(self.original,{n:(self.root/n).read_bytes() for n in self.original})
+        self.assertFalse((self.root/'updates.backup').exists())
+        self.assertEqual(self.run_service('updates-check').returncode,10)
+        self.assertEqual(self.run_service('updates-remove').returncode,0)
+
+    def test_bootstrap_failure_has_recoverable_original_files(self):
+        self.prepare()
+        (self.root/'hup-fails').touch()
+        self.assertNotEqual(self.run_service('updates-install').returncode,0)
+        self.assertTrue((self.root/'updates.backup/runtime.json').exists())
+        (self.root/'hup-fails').unlink()
+        result=self.run_service('updates-remove')
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        self.assertEqual(self.original,{n:(self.root/n).read_bytes() for n in self.original})
+
+    def test_actual_rule_readback_is_required(self):
+        cfg=self.installed()
+        cfg['rules'].insert(0,'DOMAIN,new.invalid,DIRECT')
+        self.next_config(cfg)
+        (self.root/'stale-rules').touch()
+        self.assertNotEqual(self.run_service('update').returncode,0)
+        self.assertTrue((self.root/'updates.pending').exists())
+        self.assertEqual(self.status()['result'],'reload-unknown')
+
+    def test_obsolete_group_readback_is_rejected(self):
+        cfg=self.installed()
+        cfg['rules'].insert(0,'DOMAIN,new.invalid,DIRECT')
+        self.next_config(cfg)
+        (self.root/'stale-groups').touch()
+        self.assertNotEqual(self.run_service('update').returncode,0)
+        self.assertTrue((self.root/'updates.pending').exists())
+
+    def test_unknown_absence_and_process_reuse_are_not_success(self):
+        self.prepare()
+        self.assertEqual(self.run_service('updates-check').returncode,20)
+        result=self.run_service('updates-install')
+        self.assertEqual(result.returncode,0,result.stderr.decode())
+        (self.root/'proc/91/stat').write_text(' '.join(['0']*21+['999']))
+        self.assertNotEqual(self.run_service('updates-remove').returncode,0)
+        self.assertTrue((self.root/'updates.backup').exists())
+        self.assertEqual(self.run_service('updates-check').returncode,20)
+
+
+    def test_failed_removal_restores_original_disk_files_and_keeps_recovery(self):
+        self.prepare()
+        (self.root/'hup-fails').touch()
+        self.assertNotEqual(self.run_service('updates-install').returncode,0)
+        self.assertNotEqual(self.run_service('updates-remove').returncode,0)
+        self.assertEqual(self.original,{n:(self.root/n).read_bytes() for n in self.original})
+        self.assertTrue((self.root/'updates.backup').exists())
+        self.assertTrue((self.root/'updates.pending').exists())
+
+    def test_crond_ownership_checks_executable_birth_and_entire_command(self):
+        self.prepare()
+        # Exercise the real ownership function independently of scheduler spawning.
+        helper=self.helper.replace('/data/adb/magisk/busybox',str(self.root/'busybox'))
+        proc=self.root/'proc/93'
+        proc.mkdir()
+        (proc/'exe').symlink_to(self.root/'busybox')
+        (proc/'stat').write_text(' '.join(['0']*21+['123']))
+        command=(str(self.root/'busybox')+'\0crond\0-f\0-c\0'+str(self.root/'cron')+'\0').encode()
+        (proc/'cmdline').write_bytes(command)
+        (self.root/'updates-crond.pid').write_text('93 123\n')
+        def check():
+            return subprocess.run(['sh','-c',f'cd {host.shlex.quote(str(self.root))}\nROOT={host.shlex.quote(str(self.root))}\n'+helper+'\ncron_owned'],capture_output=True).returncode
+        self.assertEqual(check(),0)
+        (proc/'cmdline').write_bytes(command.replace(b'\0-f\0',b'\0-b\0'))
+        self.assertEqual(check(),2)
+        (proc/'cmdline').write_bytes(command)
+        (proc/'stat').write_text(' '.join(['0']*21+['999']))
+        self.assertEqual(check(),2)
+        (proc/'stat').unlink()
+        self.assertEqual(check(),1)
+
+    def test_host_install_check_remove_repeat_and_failed_bootstrap(self):
+        self.prepare()
+        import shutil
+        shutil.rmtree(self.root/'updates.stage')
+        source=self.root/'source'
+        source.mkdir()
+        for n in ('service.sh','boot.sh','updates.sh','network.sh'):
+            (source/n).write_bytes((MODULE.parent/n).read_bytes())
+        (self.root/'network.sh').write_bytes((source/'network.sh').read_bytes())
+        self.tool('tailscale', '''echo '{"BackendState":"Running"}'\n''')
+        self.tool('tailscaled','exit 0\n')
+        pins={n:host.digest(self.root/n) for n in ('mihomo','tailscale','tailscaled')}
+        (source/'artifacts.json').write_text(json.dumps({'sha256':pins}))
+        self.boot.write_bytes((self.root/'boot.sh').read_bytes())
+        baseline={'source_oid':'b'*40,'sha256':pins,'config_sha256':host.digest(self.root/'config.json'),
+                  'service_sha256':host.digest(self.root/'service.sh'),
+                  'scripts_sha256':{n:host.digest(self.root/n) for n in ('network.sh','boot.sh')},
+                  'transparent':False,'autostart':True}
+        (self.root/'deployment.json').write_text(json.dumps(baseline))
+        (self.root/'boot-enabled').touch()
+        self.script=self.script.replace('schedule() { echo schedule >>', 'schedule() { mkdir -p cron; printf "%s\\n" "$CRON_LINE" > cron/root; echo schedule >>')
+        # Only daemon execution is stubbed; config/manifest/check and recovery execute in shell.
+        self.script=self.script.replace('private_root() { return 0; }','private_root() { return 0; }\ncron_owned() { return 0; }')
+        fixture=self
+        class Device(LocalShellDevice):
+            def shell(self,script,*,data=None):
+                script=script.replace('/data/adb/magisk/busybox ash','sh')
+                script=script.replace('/data/adb/magisk/busybox tar','tar')
+                script=script.replace('/data/adb/magisk/busybox flock -n 9','true')
+                script=script.replace(f'[ "$(stat -c %u:%a {fixture.root})" = 0:700 ]','true')
+                return super().shell(script,data=data)
+            def service(self,action):
+                return fixture.run_service(action)
+        url=self.root/'subscription'
+        url.write_text('https://private.invalid/secret-token\n')
+        url.chmod(0o600)
+        args=SimpleNamespace(serial='fake',source_oid='a'*40,state_dir=str(self.root/'trial'),subscription_file=str(url))
+        device=Device('fake')
+        with patch.object(host,'ROOT',str(self.root)),patch.object(host,'BOOT',str(self.boot)),patch.object(host,'HERE',source):
+            self.next_config({**self.config, 'external-controller-unix': str(self.root) + '/controller.sock'})
+            before = {n: ((self.root / n).read_bytes(), (self.root / n).stat().st_ino,
+                          (self.root / n).stat().st_mtime_ns) for n in host.UPDATE_FILES}
+            (self.root / 'download-fails').touch()
+            with self.assertRaisesRegex(host.OperationError, 'original running files and process identity restored'):
+                host.updates_install(args, device)
+            (self.root / 'download-fails').unlink()
+            self.assertEqual(before, {n: ((self.root / n).read_bytes(), (self.root / n).stat().st_ino,
+                                         (self.root / n).stat().st_mtime_ns) for n in host.UPDATE_FILES})
+            self.assertEqual(host.updates_check(args, device), 10)
+            self.assertEqual(json.loads((Path(args.state_dir) / 'updates.json').read_text())['phase'], 'restored')
+            self.assertFalse((self.root / 'signals').exists())
+            self.assertNotIn('schedule', (self.root / 'schedules').read_text().splitlines())
+            self.assertFalse((self.root / 'updates.stage').exists())
+            self.assertEqual(host.updates_install(args,device),0)
+            self.assertEqual(host.check(args,device),0)
+            self.assertEqual(host.updates_check(args,device),0)
+            record=json.loads((Path(args.state_dir)/'updates.json').read_text())
+            self.assertNotIn('secret-token',json.dumps(record))
+            staged_path = self.root / 'updates.stage/deployment.json'
+            staged_bytes = staged_path.read_bytes()
+            staged_path.write_text(json.dumps({**record['deployment'], 'source_oid': 'c' * 40}))
+            with self.assertRaisesRegex(host.OperationError, 'another staged update'):
+                host.updates_remove(args, device)
+            self.assertTrue((self.root / 'updates.backup').exists())
+            staged_path.write_bytes(staged_bytes)
+            self.assertEqual(host.updates_remove(args,device),0)
+            self.assertEqual(host.updates_check(args,device),10)
+            self.assertEqual(host.updates_remove(args,device),0)
+            # Upload failures never trigger removal of an existing/unknown transaction.
+            with patch.object(host, 'stage_updates', side_effect=host.OperationError('upload interrupted')), \
+                    patch.object(host, 'updates_remove') as remove:
+                with self.assertRaisesRegex(host.OperationError, 'upload interrupted'):
+                    host.updates_install(args, device)
+                remove.assert_not_called()
+            self.assertEqual(host.updates_remove(args, device), 0)
+            stage = self.root / 'updates.stage'
+            stage.mkdir()
+            sentinel = stage / 'deployment.json'
+            sentinel.write_bytes(b'unknown recovery material')
+            with self.assertRaises(host.OperationError):
+                host.stage_updates(device, {'deployment.json': b'replacement'})
+            self.assertEqual(sentinel.read_bytes(), b'unknown recovery material')
+            sentinel.unlink()
+            stage.rmdir()
+            self.assertEqual(host.updates_install(args,device),0)
+            self.assertEqual(host.updates_remove(args,device),0)
+            (self.root/'hup-fails').touch()
+            with self.assertRaisesRegex(host.OperationError,'recovery unverified'):
+                host.updates_install(args,device)
+            # Disk baseline is restored even when HUP never creates the controller.
+            self.assertEqual(self.original,{n:(self.root/n).read_bytes() for n in self.original})
+            self.assertEqual(json.loads((Path(args.state_dir)/'updates.json').read_text())['phase'],'prepared')
+            with self.assertRaisesRegex(host.OperationError,'state unknown'):
+                host.updates_install(args,device)
+            (self.root/'hup-fails').unlink()
+            self.assertEqual(host.updates_remove(args,device),0)
+
+    def test_start_reconfirms_runtime_digest_without_downloading_or_reloading(self):
+        self.installed()
+        runtime = self.root / "runtime.json"
+        cfg = json.loads(runtime.read_text())
+        cfg["interface-name"] = "sipa_eth9"
+        runtime.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+        (self.root / "loaded.json").write_bytes(runtime.read_bytes())
+        self.script = self.script.replace('case "$action" in', 'case "$action" in\nresume-test) resume_updates;;')
+        result = self.run_service("resume-test")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(self.status()["runtime_sha256"], host.digest(runtime))
+        self.assertEqual(self.status()["reload_count"], "0")
+        self.assertEqual((self.root / "curl-calls").read_text().count("--config"), 1)
+        self.assertNotIn("-X PUT", (self.root / "curl-calls").read_text())
+
+    def test_remove_uses_current_owned_identity_after_a_legitimate_start(self):
+        self.installed()
+        for pid, name in ((91, "mihomo"), (92, "tailscaled")):
+            (self.root / f"proc/{pid}/stat").write_text(" ".join(["0"] * 21 + ["999"]))
+            (self.root / f"{name}.pid").write_text(f"{pid} 999\n")
+        result = self.run_service("updates-remove")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(self.original, {n: (self.root / n).read_bytes() for n in self.original})
+
+
+class UpdateArgumentsTest(unittest.TestCase):
+    def test_staging_keeps_private_bytes_in_stdin_and_uses_busybox_for_the_lock(self):
+        with patch.object(host.Device, "require") as require:
+            host.stage_updates(host.Device("fake"), {"subscription.curl": b"private-token"})
+            self.assertTrue(require.call_args.args[0].startswith("/data/adb/magisk/busybox ash -c "))
+            self.assertNotIn("private-token", require.call_args.args[0])
+            self.assertIn(b"private-token", require.call_args.kwargs["data"])
+
+    def test_required_identity_and_missing_shared_adapter(self):
+        for oid in (None,'a'*7,'g'*40):
+            with self.assertRaises(host.OperationError):
+                host.update_args(SimpleNamespace(source_oid=oid,state_dir='/tmp/unused'))
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'config.json'
+            path.write_text('{"rules":["MATCH,DIRECT"],"proxies":[{}]}')
+            with patch.dict(os.environ,{'F50_PROXY_CONFIG_ROOT':directory}):
+                with self.assertRaisesRegex(host.OperationError,'Missing central F50 adapter'):
+                    host.configuration(path)
+
+    def test_private_url_boundary_precedes_device_mutation(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'url'
+            args=SimpleNamespace(source_oid='a'*40,state_dir=directory,subscription_file=str(path))
+            device=Mock()
+            for value in ('http://invalid/token','https://invalid/\nurl = bad','https://user:password@invalid/token',
+                          'https://invalid/"token','https://invalid/\\token'):
+                path.write_text(value);path.chmod(0o600)
+                with self.assertRaises(host.OperationError): host.updates_install(args,device)
+            path.write_text('https://invalid/token');path.chmod(0o644)
+            with self.assertRaises(host.OperationError): host.updates_install(args,device)
+            device.assert_not_called()
+            self.assertEqual(device.mock_calls,[])
+
+
 if __name__ == "__main__":
     unittest.main()

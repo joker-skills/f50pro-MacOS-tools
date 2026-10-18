@@ -13,6 +13,8 @@ shields-up，不通过 tailnet 暴露设备既有 Root ADB。
 `python3 device/soft-router/host.py <command> --serial <adb-serial>`。
 所有命令统一接受 `--source-oid`、`--assets-dir`、`--private-config`、`--state-dir`。
 apply 需要全部参数；restore/restore-check 需要 source-oid 和 state-dir。
+updates-install/check/remove 沿用 serial、source-oid 和 state-dir；install 另需
+`--subscription-file <0600 的私有 URL 文件>`，详情见下文。
 apply 可选 `--transparent --autostart` 和 `--geo-assets-dir <本机缓存目录>`；其它命令从部署记录读取真实模式。
 
 - `apply`：校验仓内固定二进制摘要，保存停止态 baseline，写入配置并启动。
@@ -51,6 +53,10 @@ hosts、sniffer 和 DNS nameserver / nameserver-policy / 节点 DNS policy 等�
 不包含国内直连规则，不能用它验收中心分流。唯一新增的分流规则是透明模式最前面的
 `DST-PORT,53,f50-dns`，配合内部 `type: dns` 出站。
 
+宿主直接调用中心 `render/f50.py` 的纯函数 `adapt()`，不保留第二份适配实现。
+默认从 `$JOKER_REPOS/proxy-config`（未设置时为 `~/repos/proxy-config`）加载；
+测试可通过 `F50_PROXY_CONFIG_ROOT` 指定明确 checkout，缺少共享文件直接报错。
+
 设备适配覆盖：启动时自动选择蜂窝出站网卡、rule 模式、warning 日志、关闭源 TUN 和 controller/UI，
 移除源额外端口、listeners、tunnels 及服务端入站配置。只保留 loopback mixed `17890`，
 透明模式再加双栈 loopback TPROXY `17891`。显式模式维持原有关闭 DNS/IPv6 的行为；
@@ -81,16 +87,61 @@ symlink，不接受任意上传路径；忽略其它文件。允许名单与 And
 | `ASN.mmdb` | `ASN.mmdb` |
 
 同类同时出现多个大小写文件时拒绝，显式目录没有任何名单文件时也拒绝；未指定则不上传。
-文件通过 stdin 写入设备私有目录，权限 0600。没有新增下载器、cron 或订阅服务；
+文件通过 stdin 写入设备私有目录，权限 0600；
 源配置的 Geo 自动更新行为照常保留，因此 Geo/provider 缓存不作为固定版本摘要检查对象。
 配置源及含密钥成品不进入 Git，不输出订阅 URL、节点密码或 token；部署记录只保存配置摘要。
 
-更新配置本体时，重新从同一中心订阅取得最新基础版，停止已有服务后，用新 state-dir
-经同一 apply 入口部署；不是对运行中服务做热更新，也不能覆盖一个健康或未知运行态。
-restore 仍只恢复停止态并保留 Tailscale 身份。宿主可在既有授权内短暂停启服务，
-不重启 F50、不重新登录 Tailscale；B25、Root、固件、USB 修复和 Wi-Fi 均不在本次适配范围。
-若曾手动 cleanup 透明规则而进程仍在运行，check 预期不通过；须先用原服务停止入口收尾，
-再 apply，最终验证透明规则已恢复、国内公网直连、境外命中预期代理，以及 Tailscale 仍 Running。
+## 整份中心订阅热更新
+
+在已有健康运行态上安装更新，不需要重新 apply，不停启 Mihomo/Tailscale，也不重启设备。
+二进制版本保持 artifacts.json 的固定值；此功能不升级二进制、不改 network.sh、分流策略或身份。
+订阅必须是中心基础版专用的 `mihomo-f50.json`，不是 YAML 或 JMS 版。
+中心输出约定为 `ensure_ascii=False, indent=2` 的 JSON，顶层使用唯一蜂窝接口占位符，
+且只含 F50 既有私有入口和 `/data/adb/f50-soft-router/controller.sock` Unix 控制器。
+
+- `updates-install --source-oid <完整源码 OID> --state-dir <私有目录> --subscription-file <私有 URL 文件>`：
+  校验现有部署的二进制、网络脚本、配置及原脚本摘要；先在宿主保存恢复副本，
+  设备在同一生命周期锁内先用现有安全下载、模板及 Mihomo 预检验证中心专用成品可用，
+  404、下载或校验失败会在修改运行文件、发送 HUP、启动调度之前退出，不留下半安装。
+  预检成功后才保留单份 `updates.backup`。下载的成品仅用于预检；保留当前业务配置，只加私有 Unix
+  控制器，经 Mihomo `-t` 后原子替换 runtime，核对 PID、exe、starttime 后对原 PID 发 HUP。
+  通过 Unix API 回读完整规则序列和组名集合后启用调度；引导或后续校验失败自动尝试运行态恢复。
+  URL 仅通过 stdin 上传到 0600 的 `subscription.curl`，不会进入命令参数、Git 或状态记录。
+- `updates-check`：0 为启用且配置、运行规则/组、进程及调度检查成功；10 仅表示确定未启用；
+  部分安装、待核验事务、上次更新失败或无法确认的状态返回 20。
+  legacy `check` 仍检查固定二进制、脚本、自启入口及透明规则；更新启用后根据最近已确认的
+  template/runtime 摘要检查配置，不再硬比首次配置摘要。
+- `updates-remove --source-oid <安装时 OID> --state-dir <安装时目录>`：
+  仅停止通过 PID、exe、starttime、完整 cmdline 确认归属的本模块 crond。
+  在原进程上先回读原策略，再移除 Unix 控制器并恢复原脚本、manifest、配置和 boot 入口，
+  不调用 stop/start/apply/restore。移除后 updates-check 返回 10，可重复执行。
+  本机 state-dir 只有成功恢复且重新核实原态后才允许同候选再次试验；未知恢复材料不会被覆盖。
+
+设备定时任务独占自己的 `cron/root`，不覆盖系统 crontab，正式唯一行如下：
+
+```cron
+0 */2 * * * /data/adb/magisk/busybox ash /data/adb/f50-soft-router/service.sh update
+```
+
+`service.sh update` 与启停共用 `lifecycle.lock`，用已有 curl 经本机 `127.0.0.1:17890` 代理
+下载整份订阅，要求 HTTPS 正常校验证书，限制跳转、连接/总超时和 4 MiB 成品大小。
+设备只检查固定 pretty JSON 模板字段并调用 Mihomo 预检，不安装 Python/jq/yq，也不转换通用 YAML。
+更新允许中心修改节点、provider、DNS policy、规则和组；设备入口字段变化会被拒绝。
+通过预检的变化配置原子替换后，用 Unix `PUT /configs?force=false` 重新读取固定 runtime 路径，
+要求 HTTP 204，并回读完整规则顺序及组集合；不只以 signal 或 socket 存在作为成功依据。
+未变化时不改 config/runtime 的内容、inode 或修改时间，也不 reload。
+
+下载、截断、模板或 Mihomo 预检失败保留当前配置；请求超时、非 204 或回读不符时，
+保留 `updates.pending` 和本事务的前一份配置，拒绝后续 cron 覆盖，check 失败。
+此时保留 state-dir，用同候选的 updates-remove 恢复并核实，不能重放 install 或调用停止态 restore。
+恢复中的 HUP 也失败时会把原文件放回磁盘、保留恢复材料并返回失败，不把磁盘恢复当作运行态成功。
+
+无凭证的 `update.status` 含 last_attempt、last_success、reload_count、config_sha256、result，
+并记录已确认的 runtime_sha256。changed 成功才增加 reload_count，unchanged 仅推进检查成功时间。
+成功的 boot/start 路径幂等恢复本模块调度；新启动会验证已确认模板和运行规则后刷新 runtime 摘要。
+手动停服务后，cron 不会拉起代理；没有增加看门狗。运行中换接口仍需既有停止/启动入口。
+完整国内/国外出口、反套娃、真实 DNS/UDP/IPv6、原 PID HUP 和长连接保持必须由独立实机探针确认，
+本地单测不代表这些验收已经完成。
 
 ## 透明代理与自启边界
 
