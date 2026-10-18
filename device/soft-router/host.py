@@ -3,6 +3,9 @@
 import argparse
 import fcntl
 import hashlib
+import importlib.util
+import io
+import tarfile
 import json
 import os
 from pathlib import Path
@@ -39,48 +42,18 @@ def configuration(path, transparent=False):
             source = yaml.safe_load(text)
         except yaml.YAMLError:
             raise OperationError("Invalid private YAML configuration") from None
-    if not isinstance(source, dict):
-        raise OperationError("Private configuration must be a mapping")
-    rules = source.get("rules")
-    proxies = source.get("proxies", [])
-    providers = source.get("proxy-providers", {})
-    groups = source.get("proxy-groups", [])
-    dns = source.get("dns", {})
-    if (not isinstance(rules, list) or not rules or
-            any(not isinstance(rule, str) for rule in rules) or
-            not isinstance(proxies, list) or any(not isinstance(p, dict) for p in proxies) or
-            not isinstance(providers, dict) or not (proxies or providers) or
-            not isinstance(groups, list) or any(not isinstance(g, dict) for g in groups) or
-            not isinstance(dns, dict)):
-        raise OperationError("Proxy configuration requires proxies/providers, rules and a DNS mapping")
-    # Keep the central routing policy; replace only device ingress and interface settings.
-    config = dict(source)
-    for key in ("port", "socks-port", "redir-port", "tproxy-port", "listeners", "tunnels",
-                "ss-config", "vmess-config", "tuic-server", "external-controller",
-                "external-controller-tls", "external-controller-unix", "external-controller-pipe",
-                "external-controller-cors", "external-ui", "external-ui-name", "external-ui-url", "secret"):
-        config.pop(key, None)
-    config.update({"mixed-port": 17890, "bind-address": "127.0.0.1",
-                   "allow-lan": False, "mode": "rule", "log-level": "warning",
-                   "ipv6": transparent, "interface-name": "__F50_CELLULAR_INTERFACE__",
-                   "tun": {"enable": False},
-                   "dns": {**dns, "enable": transparent, "listen": "127.0.0.1:0"}})
-    if transparent:
-        if any(proxy.get("name") == "f50-dns" for proxy in proxies) or any(
-                group.get("name") == "f50-dns" for group in groups):
-            raise OperationError("Reserved proxy name f50-dns")
-        # Legacy single-node JSON had no DNS settings; keep its original bootstrap defaults.
-        resolver = dns if "nameserver" in dns else {
-            "respect-rules": True, "nameserver": ["https://1.1.1.1/dns-query"],
-            "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"], **dns}
-        config.update({"listeners": [
-            {"name": "f50-tp4", "type": "tproxy", "listen": "127.0.0.1", "port": 17891, "udp": True},
-            {"name": "f50-tp6", "type": "tproxy", "listen": "::1", "port": 17891, "udp": True}],
-            "proxies": proxies + [{"name": "f50-dns", "type": "dns"}],
-            "rules": ["DST-PORT,53,f50-dns"] + rules,
-            "dns": {**resolver, "enable": True, "listen": "127.0.0.1:0", "ipv6": True,
-                    "enhanced-mode": "redir-host"}})
-    return config
+    root = Path(os.environ.get("F50_PROXY_CONFIG_ROOT", str(
+        Path(os.environ.get("JOKER_REPOS", str(Path.home() / "repos"))) / "proxy-config")))
+    helper = root / "render/f50.py"
+    if not helper.is_file():
+        raise OperationError("Missing central F50 adapter: set F50_PROXY_CONFIG_ROOT to its checkout")
+    spec = importlib.util.spec_from_file_location("f50_central_adapter", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.adapt(source, transparent=transparent)
+    except ValueError:
+        raise OperationError("Invalid private F50 configuration") from None
 
 
 # Mihomo filenames differ in case from Clash Verge's Mac cache; normalize on Android.
@@ -118,8 +91,8 @@ class Device:
 
     def shell(self, script, *, data=None):
         return subprocess.run(["adb", "-s", self.serial, "shell",
-                               "su -c " + shlex.quote(script)], input=data, capture_output=True,
-                              timeout=90)
+                               "/debug_ramdisk/su -c " + shlex.quote(script)], input=data, capture_output=True,
+                              timeout=240)
 
     def require(self, script, *, data=None):
         result = self.shell(script, data=data)
@@ -136,6 +109,8 @@ class Device:
 
     def service(self, action):
         script = (HERE / "service.sh").read_text()
+        if action.startswith("updates-"):
+            script = script.replace('# UPDATE_FUNCTIONS', (HERE / "updates.sh").read_text())
         return self.shell(f"/data/adb/magisk/busybox ash -c {shlex.quote(script)} -- {shlex.quote(action)}")
 
 
@@ -220,8 +195,15 @@ def check(args, device):
     if result.returncode:
         return result.returncode if result.returncode == 10 else 20
     record = json.loads(device.require(f"cat {ROOT}/deployment.json"))
+    updates = device.shell(f"[ -e {ROOT}/updates.enabled ] || [ -e {ROOT}/updates.backup ]")
+    updating = updates.returncode == 0
+    if updating and updates_check(args, device):
+        return 20
     if getattr(args, "state_dir", None):
-        local = json.loads((Path(args.state_dir) / "deployment.json").read_text())
+        local_path = Path(args.state_dir) / ("updates.json" if updating else "deployment.json")
+        local = json.loads(local_path.read_text())
+        if updating:
+            local = local["deployment"]
         if record != local:
             return 20
     if args.source_oid and record["source_oid"] != args.source_oid:
@@ -234,9 +216,14 @@ def check(args, device):
         return 20
     if record["service_sha256"] != digest(HERE / "service.sh"):
         return 20
-    expected = {**pinned, "config.json": record["config_sha256"],
+    config_sha = record["config_sha256"]
+    if updating:
+        config_sha = device.require(f"sed -n 's/^config_sha256=//p' {ROOT}/update.status").decode().strip()
+        if not re.fullmatch("[0-9a-f]{64}", config_sha):
+            return 20
+    expected = {**pinned, "config.json": config_sha,
                 "service.sh": record["service_sha256"]}
-    for name in ("network.sh", "boot.sh"):
+    for name in (("network.sh", "boot.sh", "updates.sh") if updating else ("network.sh", "boot.sh")):
         if record["scripts_sha256"][name] != digest(HERE / name):
             return 20
         expected[name] = record["scripts_sha256"][name]
@@ -297,15 +284,207 @@ def tailscale_status(device, wait=False):
         raise OperationError("Tailscale has not reached a recognized ready state; inspect ts-status")
 
 
+UPDATE_FILES = ("service.sh", "boot.sh", "deployment.json", "config.json", "runtime.json")
+
+
+def update_args(args):
+    if not re.fullmatch(r"[0-9a-f]{40}", args.source_oid or "") or not args.state_dir:
+        raise OperationError("Updates require a full source OID and private state directory")
+    return Path(args.state_dir)
+
+
+def updates_check(args, device):
+    result = device.service("updates-check")
+    if result.returncode == 10:
+        return 10
+    if result.returncode:
+        return 20
+    record = json.loads(device.require(f"cat {ROOT}/deployment.json"))
+    if args.source_oid and record.get("source_oid") != args.source_oid:
+        return 20
+    for name in ("service.sh", "boot.sh", "updates.sh"):
+        expected = record["service_sha256"] if name == "service.sh" else record["scripts_sha256"][name]
+        if expected != digest(HERE / name):
+            return 20
+        if device.require(f"sha256sum {ROOT}/{name}").decode().split()[0] != expected:
+            return 20
+    if getattr(args, "state_dir", None):
+        journal = Path(args.state_dir) / "updates.json"
+        if not journal.is_file():
+            raise OperationError("Enabled updates require their install state directory (updates.json)")
+        saved = json.loads(journal.read_text())
+        if saved["serial"] != args.serial or saved["deployment"] != record:
+            return 20
+    return 0
+
+
+def stage_updates(device, files):
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode="w") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(content))
+    script = (f"set -e; umask 077; exec 9> {ROOT}/lifecycle.lock; "
+              f"/data/adb/magisk/busybox flock -n 9; mkdir {ROOT}/updates.stage; "
+              f"/data/adb/magisk/busybox tar -xf - -C {ROOT}/updates.stage")
+    device.require("/data/adb/magisk/busybox ash -c " + shlex.quote(script), data=data.getvalue())
+
+
+def updates_install(args, device):
+    state = update_args(args)
+    url_path = Path(args.subscription_file or "")
+    if not url_path.is_file() or url_path.is_symlink() or url_path.stat().st_mode & 0o077:
+        raise OperationError("Subscription file must be a private regular file")
+    url = url_path.read_text().strip()
+    # URL becomes a curl config value, never a shell/argv value.
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password or
+            any(c.isspace() or c in '\\"' or ord(c) < 32 for c in url)):
+        raise OperationError("Subscription must be one HTTPS URL without curl-config escapes")
+    status = device.service("updates-check").returncode
+    if status != 10:
+        raise OperationError("Updates already enabled or state unknown; check/remove before installing")
+    if device.service("check").returncode:
+        raise OperationError("Existing running deployment must be healthy")
+    device.require(f'[ ! -L {ROOT} ] && [ "$(stat -c %u:%a {ROOT})" = 0:700 ]')
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(state, 0o700)
+    journal = state / "updates.json"
+    if journal.exists():
+        previous = json.loads(journal.read_text())
+        if (previous.get("phase") != "restored" or previous["serial"] != args.serial or
+                previous["source_oid"] != args.source_oid):
+            raise OperationError("State contains unresolved recovery material")
+        verify_update_baseline(previous, state, device)
+    originals = {}
+    for name in UPDATE_FILES:
+        originals[name] = device.require(f"cat {ROOT}/{name}")
+    boot = device.shell(f"if [ -L {BOOT} ]; then exit 20; elif [ -f {BOOT} ]; then cat {BOOT}; "
+                        f"elif [ -e {BOOT} ]; then exit 20; else exit 10; fi")
+    if boot.returncode not in (0, 10):
+        raise OperationError("Unknown boot entry")
+    if boot.returncode == 0:
+        originals["boot-entry"] = boot.stdout
+    baseline = json.loads(originals["deployment.json"])
+    expected_baseline = {"config.json": baseline["config_sha256"],
+                         "service.sh": baseline["service_sha256"],
+                         "boot.sh": baseline["scripts_sha256"]["boot.sh"]}
+    if any(hashlib.sha256(originals[n]).hexdigest() != sha for n, sha in expected_baseline.items()):
+        raise OperationError("Running baseline differs from its deployment manifest")
+    pinned = json.loads((HERE / "artifacts.json").read_text())["sha256"]
+    if baseline["sha256"] != pinned:
+        raise OperationError("Running binary manifest differs from pinned releases")
+    for name, sha in {**pinned, "network.sh": baseline["scripts_sha256"]["network.sh"]}.items():
+        if device.require(f"sha256sum {ROOT}/{name}").decode().split()[0] != sha:
+            raise OperationError("Running binary or network script digest differs")
+    if "boot-entry" in originals and hashlib.sha256(originals["boot-entry"]).hexdigest() != expected_baseline["boot.sh"]:
+        raise OperationError("Boot entry differs from the baseline script")
+    if baseline["autostart"]:
+        if "boot-entry" not in originals:
+            raise OperationError("Baseline autostart entry is missing")
+        device.require(f"[ -f {ROOT}/boot-enabled ]")
+    config = json.loads(originals["config.json"])
+    if config.get("external-controller-unix") or any(config.get(k) for k in
+            ("external-controller", "external-controller-tls", "external-ui")):
+        raise OperationError("Baseline has an unexpected controller")
+    config["external-controller-unix"] = ROOT + "/controller.sock"
+    identity = device.require(f"cat {ROOT}/mihomo.pid {ROOT}/tailscaled.pid")
+    record = {**baseline, "source_oid": args.source_oid,
+              "service_sha256": digest(HERE / "service.sh"),
+              "scripts_sha256": {**baseline["scripts_sha256"],
+                                 **{n: digest(HERE / n) for n in ("boot.sh", "updates.sh")}}}
+    if baseline["scripts_sha256"]["network.sh"] != digest(HERE / "network.sh"):
+        raise OperationError("Network script differs from this source")
+    saved = {"serial": args.serial, "source_oid": args.source_oid, "phase": "prepared",
+             "deployment": record, "identity": identity.decode(),
+             "baseline_sha256": {n: hashlib.sha256(b).hexdigest() for n, b in originals.items()}}
+    # Write recovery before touching any running file; fixed names never include URL/token.
+    for name, content in originals.items():
+        fd = os.open(state / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+    private_write(journal, saved)
+    files = {n: (HERE / n).read_bytes() for n in ("service.sh", "boot.sh", "updates.sh")}
+    files.update({"config.json": (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode(),
+                  "deployment.json": json.dumps(record).encode(), "identity": identity,
+                  "boot-present": b"yes\n" if "boot-entry" in originals else b"no\n",
+                  "subscription.curl": ('url = "' + url + '"\n').encode(),
+                  "baseline.sha": "".join(f"{sha}  {BOOT if n == 'boot-entry' else ROOT + '/' + n}\n"
+                                          for n, sha in saved["baseline_sha256"].items()).encode()})
+    # A failed/existing stage is unknown recovery material; do not overwrite or remove it.
+    stage_updates(device, files)
+    try:
+        if device.service("updates-install").returncode:
+            raise OperationError("Original-PID controller bootstrap failed")
+        saved["phase"] = "installed"
+        private_write(journal, saved)
+        if check(args, device) or updates_check(args, device):
+            raise OperationError("Installed updates failed verification")
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError):
+        try:
+            updates_remove(args, device)
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError):
+            raise OperationError("Install incomplete and recovery unverified; keep state and inspect") from None
+        raise OperationError("Install failed; original running files and process identity restored") from None
+    return 0
+
+
+def verify_update_baseline(saved, state, device):
+    for name, sha in saved["baseline_sha256"].items():
+        path = BOOT if name == "boot-entry" else ROOT + "/" + name
+        # runtime is derived from the original template and the current cellular interface.
+        if digest(state / name) != sha or (name != "runtime.json" and
+                device.require(f"sha256sum {path}").decode().split()[0] != sha):
+            raise OperationError("Baseline file restoration could not be verified")
+    if "boot-entry" not in saved["baseline_sha256"]:
+        device.require(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]")
+    if device.require(f"cat {ROOT}/mihomo.pid {ROOT}/tailscaled.pid").decode() != saved["identity"]:
+        raise OperationError("Original process identity changed")
+    # Validate runtime/network normally, excluding update health while retaining its backup.
+    if device.service("updates-restored-check").returncode:
+        raise OperationError("Restored running baseline is unhealthy")
+
+
+def updates_remove(args, device):
+    state = update_args(args)
+    saved = json.loads((state / "updates.json").read_text())
+    if saved["serial"] != args.serial or saved["source_oid"] != args.source_oid:
+        raise OperationError("Restore target differs from saved update baseline")
+    remote = json.loads(device.require(f"cat {ROOT}/deployment.json"))
+    baseline = json.loads((state / "deployment.json").read_text())
+    if remote not in (saved["deployment"], baseline):
+        raise OperationError("Refusing to remove a different deployment")
+    staged = device.shell(f"cat {ROOT}/updates.stage/deployment.json")
+    if staged.returncode == 0 and json.loads(staged.stdout) != saved["deployment"]:
+        raise OperationError("Refusing to remove another staged update")
+    restore_identity = device.require(f"cat {ROOT}/mihomo.pid {ROOT}/tailscaled.pid").decode()
+    if device.service("updates-remove").returncode:
+        raise OperationError("Running update removal incomplete; keep recovery material")
+    verify_update_baseline({**saved, "identity": restore_identity}, state, device)
+    if device.service("updates-finalize").returncode:
+        raise OperationError("Restored baseline verified but update cleanup incomplete; keep state")
+    if device.service("updates-check").returncode != 10:
+        raise OperationError("Updates absence is not confirmed")
+    saved["phase"] = "restored"
+    saved["identity"] = restore_identity
+    private_write(state / "updates.json", saved)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["apply", "check", "restore", "restore-check", "login", "ts-status"])
+    parser.add_argument("command", choices=["apply", "check", "restore", "restore-check", "login", "ts-status",
+                                                  "updates-install", "updates-check", "updates-remove"])
     parser.add_argument("--serial", required=True)
     parser.add_argument("--source-oid")
     parser.add_argument("--assets-dir")
     parser.add_argument("--private-config", help="Private central Mihomo YAML or legacy JSON")
     parser.add_argument("--geo-assets-dir", help="Optional local directory of cached Mihomo Geo assets")
     parser.add_argument("--state-dir")
+    parser.add_argument("--subscription-file", help="Private HTTPS F50 JSON subscription URL file")
     parser.add_argument("--transparent", action="store_true")
     parser.add_argument("--autostart", action="store_true")
     args = parser.parse_args()
@@ -318,6 +497,9 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if args.command == "apply":
             result = apply(args, device)
+        elif args.command.startswith("updates-"):
+            result = {"updates-install": updates_install, "updates-check": updates_check,
+                      "updates-remove": updates_remove}[args.command](args, device)
         elif args.command == "check":
             result = check(args, device)
         elif args.command in ("restore", "restore-check"):
