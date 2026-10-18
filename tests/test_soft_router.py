@@ -22,13 +22,13 @@ def setUpModule():
     root = Path(os.environ.get("F50_PROXY_CONFIG_ROOT", str(
         Path(os.environ.get("JOKER_REPOS", str(Path.home() / "repos"))) / "proxy-config")))
     helper = root / "render/f50.py"
-    expected = "faebc31fd41be0922f670fb8a85a86de3a9ebfc0580d11a5285ac7d85bf877ac"
+    expected = "b199130130ac5a7ae27ec3a13d1b6ef2ddd9185546f39ba0fea9386477f852f9"
     if not helper.is_file() or hashlib.sha256(helper.read_bytes()).hexdigest() != expected:
-        raise RuntimeError("Tests require render/f50.py from proxy-config bbf3c070; "
+        raise RuntimeError("Tests require the pinned render/f50.py from proxy-config; "
                            "set F50_PROXY_CONFIG_ROOT to that checkout (SHA256 " + expected + ")")
     adapter_environment = patch.dict(os.environ, {"F50_PROXY_CONFIG_ROOT": str(root.resolve())})
     adapter_environment.start()
-    print("F50 test adapter: proxy-config bbf3c070, SHA256 " + expected)
+    print("F50 test adapter: proxy-config render/f50.py, SHA256 " + expected)
 
 
 def tearDownModule():
@@ -106,17 +106,26 @@ class ExplicitConfigTest(unittest.TestCase):
                     path = Path(d) / "private"
                     path.write_text(encode(source))
                     cfg = host.configuration(path, transparent)
-                    for key in ("proxy-groups", "proxy-providers", "rule-providers", "hosts", "sniffer",
+                    for key in ("proxy-groups", "proxy-providers", "hosts", "sniffer",
                                 "geodata-mode", "geo-auto-update"):
                         self.assertEqual(cfg[key], source[key])
-                    self.assertEqual(cfg["rules"][1:] if transparent else cfg["rules"], source["rules"])
+                    if transparent:
+                        self.assertEqual(cfg["rule-providers"], {
+                            **source["rule-providers"],
+                            "f50-proxy-transports": {"type": "inline", "behavior": "classical",
+                                "payload": ["AND,((DOMAIN,node.invalid),(DST-PORT,443),(NETWORK,TCP))"]},
+                        })
+                        self.assertEqual(cfg["rules"], ["DST-PORT,53,f50-dns",
+                            "RULE-SET,f50-proxy-transports,DIRECT"] + source["rules"])
+                    else:
+                        self.assertEqual(cfg["rule-providers"], source["rule-providers"])
+                        self.assertEqual(cfg["rules"], source["rules"])
                     self.assertEqual(cfg["proxies"][:-1] if transparent else cfg["proxies"], source["proxies"])
                     for key in ("nameserver", "default-nameserver", "proxy-server-nameserver",
                                 "nameserver-policy", "proxy-server-nameserver-policy", "respect-rules"):
                         self.assertEqual(cfg["dns"][key], source["dns"][key])
                     if transparent:
                         self.assertEqual(cfg["dns"]["enhanced-mode"], "redir-host")
-                        self.assertEqual(cfg["rules"][0], "DST-PORT,53,f50-dns")
                     self.assertEqual(cfg["dns"]["listen"], "127.0.0.1:0")
         # The same provider can supply every proxy without inline nodes.
         source.pop("proxies")
