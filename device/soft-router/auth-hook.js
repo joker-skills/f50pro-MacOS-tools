@@ -1,4 +1,4 @@
-// Temporary, process-local hook. No APK, Settings, network, or boot changes.
+// Process-local hook. Persistence is managed separately by auth-service.sh.
 import Java from 'frida-java-bridge';
 
 let method;
@@ -6,9 +6,15 @@ let feature;
 let reflected;
 let active = false;
 let calls = 0;
+let flushed = false;
+let session = '';
+let nonce = '';
 
 function report(event, extra = {}) {
-  send({ event, pid: Process.id, active, calls, ...extra });
+  const message = { event, pid: Process.id, active, calls,
+    ...(flushed ? { session, nonce } : {}), ...extra };
+  // Official frida-inject explicitly flushes this channel even without a TTY.
+  send(flushed ? ['frida:stdout', JSON.stringify(message) + '\n'] : message);
 }
 
 function restore() {
@@ -38,7 +44,9 @@ function apply() {
 }
 
 rpc.exports = {
-  init() {
+  init(_stage, parameters = {}) {
+    flushed = parameters.flush === true;
+    session = parameters.session || '';
     return new Promise((resolve, reject) => {
       if (!Java.available || Process.arch !== 'arm64') {
         reject(new Error('Expected Android ARM64 Java process'));
@@ -70,9 +78,16 @@ rpc.exports = {
     });
   },
   onFridaStdin(line) {
+    const parts = line.trim().split(/\s+/);
+    const command = parts[0];
+    const requestNonce = parts[1] || '';
     Java.perform(() => {
+      nonce = requestNonce;
       try {
-        switch (line.trim()) {
+        if (parts.length > 2 || !/^[a-zA-Z0-9_-]{0,96}$/.test(nonce)) {
+          throw new Error('Invalid command nonce');
+        }
+        switch (command) {
           case 'status': report('status'); break;
           case 'probe': probe(); break;
           case 'restore': restore(); break;

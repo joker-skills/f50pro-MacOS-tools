@@ -106,3 +106,44 @@ test('restoration errors reject init without falsely reporting inactive', async 
   assert.equal(method.implementation, null);
   assert.equal(messages.at(-1).active, false);
 });
+
+test('persistent output flushes and correlates nonce, including restoration failures', async () => {
+  const options = {};
+  const { api, messages, method } = fixture('com.zte.web', 'boolean', options);
+  await api.init('early', { flush: true, session: 'session-123' });
+  const decoded = () => {
+    const [channel, line] = messages.at(-1);
+    assert.equal(channel, 'frida:stdout');
+    assert.ok(line.endsWith('\n'));
+    return JSON.parse(line);
+  };
+  assert.equal(decoded().event, 'installed');
+  api.onFridaStdin('probe request-1\n');
+  assert.deepEqual(decoded(), { event: 'probe-passed', pid: 123, active: true,
+    calls: 2, session: 'session-123', nonce: 'request-1', returned: false });
+  options.restoreError = true;
+  api.onFridaStdin('restore request-2\n');
+  assert.equal(decoded().nonce, 'request-2');
+  assert.equal(decoded().event, 'failed');
+  assert.equal(decoded().active, true);
+  api.onFridaStdin('status request-3\n');
+  assert.equal(decoded().active, true);
+  assert.equal(decoded().nonce, 'request-3');
+  options.restoreError = false;
+  api.onFridaStdin('restore request-4\n');
+  assert.equal(decoded().active, false);
+  assert.equal(method.implementation, null);
+  api.onFridaStdin('status request-5\n');
+  assert.equal(decoded().active, false);
+  api.onFridaStdin('probe request-6\n');
+  assert.equal(decoded().event, 'failed');
+  assert.equal(decoded().active, false);
+});
+
+test('persistent init failure retains truthful active state with flush enabled', async () => {
+  const { api, messages } = fixture('com.zte.web', 'boolean', { probe: 'no-hit', restoreError: true });
+  await assert.rejects(api.init('early', { flush: true, session: 'failure' }), /Restoration failed/);
+  const message = JSON.parse(messages.at(-1)[1]);
+  assert.equal(message.event, 'failed');
+  assert.equal(message.active, true);
+});
