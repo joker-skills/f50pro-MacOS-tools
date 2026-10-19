@@ -183,6 +183,39 @@ pending、回读或调度故障仍由 updates-check 返回非零报告。
 
 ## 来源与验证边界
 
+### 临时终端认证方法试验
+
+`auth-hook.js` 仅供明确授权后的进程级试验：使用官方 Frida 注入器及
+`frida-java-bridge` 编译产物，附加到既有 `com.zte.web` 进程，只将
+`FeatureConfig.isSecondAuthOpen(android.content.Context)` 替换为返回 `false`。
+不改 APK、签名策略、Settings、代理、云管理服务或开机入口，不使用全局反优化。
+执行前须备份原始 APK、编译缓存和认证配置，核对实际固件及方法签名。
+本试验只支持直接声明在 `FeatureConfig` 的静态 boolean 方法；不尝试适配父类或实例方法。
+
+本次实测工具版本为官方 `frida-inject 17.24.2`、`frida-java-bridge 7.0.13`、
+`frida-compile 19.1.0`。Java bridge 从 Frida 17 起须显式打包，不能直接加载本 ESM 源文件。
+在仓库以外的私有构建目录，复制 `auth-hook.js` 后运行：
+
+```sh
+npm install --no-audit --no-fund frida-java-bridge@7.0.13 frida-compile@19.1.0
+./node_modules/.bin/frida-compile auth-hook.js -o auth-hook.bundle.js
+```
+
+保留该构建目录生成的 `package-lock.json`。Android ARM64 注入器从
+[Frida 官方发布](https://github.com/frida/frida/releases/tag/17.24.2) 取得，并核验发布摘要。
+将工具和 bundle 放到设备仅 root 可访问的任务目录；核对目标 PID 后，以 root 执行
+`frida-inject -p <PID> -i -s <bundle绝对路径>`。不启动 Frida Server，不增加监听端口。
+本地验证除原 Python 测试外还须运行 `node --test tests/test_auth_hook.mjs`，只需 Node 内置 test runner，无 npm 测试依赖。
+
+使用注入器交互模式 `-i`，不要使用无法按此入口撤销的 `--eternalize`。
+脚本支持输入 `status`、`probe`、`restore` 和 `apply`；`restore` 恢复原函数，
+不恢复旧的云端配置。安装时会通过反射和命中计数验证替换后的 ART 调用，
+失败则撤销本次替换。该自检不重新开启真实认证、不代表其它认证路径已关闭。
+试验结束先输入 `restore` 并回读，再退出注入器，检查原进程和业务状态。
+厂商进程重启或设备重启后补丁失效；此试验没有自动重注入或自启能力。
+注入器或 ADB 交互会话中断也可能卸载补丁，须重新检查，不能承诺脱离会话仍生效。
+安装成功日志不代替小程序、本地管理与实际联网验收。
+
 部署思路参考 Tai1win10c/zte-f50pro-macos-toolkit，本目录独立实现，未复制其源码或镜像。
 二进制来自官方 MetaCubeX/mihomo Android arm64 与 Tailscale Linux arm64 release；
 版本和摘要见 artifacts.json。上游许可随其官方发布适用；本仓不分发二进制。
