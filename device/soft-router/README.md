@@ -260,6 +260,9 @@ python3 device/soft-router/host.py auth-restore-check --serial SERIAL --state-di
 `com.zte.web`，后面只允许 Android 的 NUL 填充；摘要记录原始完整字节，不能与一个
 固定字符串的摘要比较。额外参数、同前缀进程、多目标或 PID 复用均不能通过目标确认。
 注入器另核对 executable 路径。
+目标和注入器用 Android 的精确 `pidof com.zte.web` / `pidof frida-inject` 查询候选，
+仅核验候选的完整身份；监督器存活由其独占 auth.lock 和已记录身份确认，不逐 PID 扫描。
+不承诺检测 root 改名隐藏的注入器。
 私有 FIFO 以 RDWR 打开保持 stdin，注入器仅继承 fd 0，关闭监督锁和原 FIFO fd。
 每次新注入必须收到本会话 installed，再收到带新 nonce 的 probe-passed；之后每 30 秒
 反射调用必须返回 false 且命中计数恰好 +1。check 会要求额外的新鲜探针，不复用旧日志。
@@ -277,8 +280,8 @@ python3 device/soft-router/host.py auth-restore-check --serial SERIAL --state-di
 84 MB ELF 在启动、重新注入、元数据变化时完整 hash；轮询复用 inode/size/mtime/ctime/
 uid/mode 指纹，避免每 30 秒读两份 ELF。这不是 root 防篡改机制，同秒同长度且元数据不变的
 恶意改写不在保证范围内。恢复副本任何校验失败立即停止恢复并报告，不反向采信工作文件。
-session.log 每次请求前清空，注入器和监督日志另受 256 个 shell 文件块的 ulimit 上限约束
-（块大小随 shell，最多约 256 KiB）；达到上限可令进程退出，需检查并人工恢复。
+hook 不逐业务调用写日志，session.log 每次请求前清空，正常监督循环没有持续输出，
+致命错误退出。不设置文件大小 ulimit：该限制同样作用于 Frida 的 memfd，会阻止加载 agent。
 
 仅在确认直接子进程已消失或为原 starttime 的 zombie 后，才允许每隔至少 30 秒重试，
 连续三次失败停止；健康探针成功后重置计数。新注入前每隔至少 30 秒确认
@@ -306,7 +309,8 @@ manifest/source_oid、目录和文件集合，仅用逐个 rm 与 rmdir 清理�
 
 `auth-restore-check` 必须先成功加载同一 serial/source_oid/state-dir 的有效宿主备份，
 再只读确认工作目录、golden、自启入口、staging 和本认证进程均不存在；全部确认返回 0，
-否则 20。查询不在设备上创建或截断锁文件，不恢复文件或发送信号。
+同一备份的 manifest/source_oid、设备资产及已有进程身份均确认而仍部署时返回 10，
+异常、损坏或身份未知返回 20。查询不在设备上创建或截断锁文件，不恢复文件或发送信号。
 候选 A 试验结束后，用 A 的备份执行 remove → restore-check；确认干净后，正式交付
 用新的 state-dir 和真实 merge OID 执行 install → check。不能改写旧 source_oid 冒充
 merge OID；安装不同 manifest 的守卫保持有效。

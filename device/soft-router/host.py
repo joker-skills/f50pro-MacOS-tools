@@ -575,7 +575,6 @@ def auth_install(args, device):
         'if [ -e "$A/supervisor.log" ] || [ -L "$A/supervisor.log" ]; then\n'
         '  [ -f "$A/supervisor.log" ] && [ ! -L "$A/supervisor.log" ] && '
         '[ "$(stat -c %u:%a "$A/supervisor.log")" = 0:600 ] || exit 20\nfi\n'
-        'ulimit -f 256\n'
         '/data/adb/magisk/busybox nohup /data/adb/magisk/busybox ash "$G/auth-service.sh" run '
         '</dev/null > "$A/supervisor.log" 2>&1 &\n'
     ).encode()
@@ -633,12 +632,14 @@ def auth_remove(args, device):
 
 def auth_restore_check(args, device):
     state = auth_state(args)
-    auth_read_backup(state, args)
-    result = auth_service(device, "restore-check")
+    _, files = auth_read_backup(state, args)
+    expected = hashlib.sha256(files["manifest"]).hexdigest()
+    result = auth_service(device, "restore-check " + expected + " " + args.source_oid)
     restored = result.returncode == 0
-    print(json.dumps({"source_oid": args.source_oid, "state": "uninstalled" if restored else "unconfirmed",
+    status = {0: "uninstalled", 10: "deployed"}.get(result.returncode, "unconfirmed")
+    print(json.dumps({"source_oid": args.source_oid, "state": status,
                       "restored": restored}, separators=(",", ":")))
-    return 0 if restored else 20
+    return result.returncode if result.returncode in (0, 10) else 20
 
 
 def main():

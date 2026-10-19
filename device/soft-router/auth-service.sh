@@ -96,12 +96,15 @@ id_json() {
 }
 target() {
     found=
-    for proc in /proc/[0-9]*; do
-        [ "$(tr '\000' '\n' 2>/dev/null < "$proc/cmdline" | head -n 1)" = com.zte.web ] || continue
+    pids=$(/system/bin/pidof com.zte.web)
+    result=$?
+    [ "$result" -le 1 ] || return 20
+    for pid in $pids; do
+        case "$pid" in ''|*[!0-9]*) return 20;; esac
         # Android pads argv[0] with NULs. Keep the complete bytes in identity,
         # but accept only that exact first argument followed entirely by NULs.
-        [ "$(tr -d '\000' < "$proc/cmdline"; printf .)" = com.zte.web. ] || return 20
-        candidate=$(identity "${proc##*/}") || return 20
+        [ "$(tr -d '\000' < "/proc/$pid/cmdline"; printf .)" = com.zte.web. ] || return 20
+        candidate=$(identity "$pid") || return 20
         [ -z "$found" ] || return 20
         found=$candidate
     done
@@ -109,23 +112,18 @@ target() {
     echo "$found"
 }
 no_other_injector() {
-    for proc in /proc/[0-9]*; do
-        first=$(tr '\000' '\n' 2>/dev/null < "$proc/cmdline" | head -n 1)
-        case "${first##*/}" in
-            *frida*inject*)
-                current=$(identity "${proc##*/}") || continue
-                [ -n "$injector" ] && [ "$current" = "$injector" ] || return 20;;
-        esac
+    pids=$(/system/bin/pidof frida-inject)
+    result=$?
+    [ "$result" -le 1 ] || return 20
+    for pid in $pids; do
+        current=$(identity "$pid") || return 20
+        [ -n "$injector" ] && [ "$current" = "$injector" ] && injector_alive || return 20
     done
 }
 idle() {
     injector=
     no_other_injector || return 20
-    for proc in /proc/[0-9]*; do
-        if tr '\000' '\n' 2>/dev/null < "$proc/cmdline" | grep -Fxq -e "$G/auth-service.sh" -e "$A/auth-service.sh" -e "$B"; then
-            return 20
-        fi
-    done
+    # Every supervisor holds auth.lock; no process-table scan is needed.
     if [ -e "$P/auth.lock" ] || [ -L "$P/auth.lock" ]; then
         regular "$P/auth.lock" 600 || return 20
         exec 9< "$P/auth.lock"
@@ -219,7 +217,7 @@ launch() {
     session=$(nonce_new)
     request=
     parameters="{\"flush\":true,\"session\":\"$session\"}"
-    ( exec 9>&- 8>&-; ulimit -f 256
+    ( exec 9>&- 8>&-
       exec "$A/frida-inject" -p "${target_id%% *}" -i -s "$A/auth-hook.bundle.js" -P "$parameters" <&7 7>&- >> "$A/session.log" 2>&1 ) &
     child=$!
     # The fork may still be between ash and exec; wait for the exact ELF/argv.
@@ -295,7 +293,7 @@ start() {
     [ ! -L "$A/enabled" ] && [ ! -d "$A/enabled" ] || return 20
     : > "$A/enabled"
     # One detached supervisor; neither the injector nor launcher holds its lock.
-    ( ulimit -f 256; exec "$BB" nohup "$BB" ash "$G/auth-service.sh" run </dev/null > "$A/supervisor.log" 2>&1 8>&- 9>&- ) &
+    ( exec "$BB" nohup "$BB" ash "$G/auth-service.sh" run </dev/null > "$A/supervisor.log" 2>&1 8>&- 9>&- ) &
 }
 check() {
     runtime_safe || return 20
@@ -351,6 +349,37 @@ known_entries() {
         case " $2 " in *" ${path##*/} "*) ;; *) fail 'unknown cleanup entry; keeping material'; return 20;; esac
         [ ! -L "$path" ] && [ ! -d "$path" ] || return 20
     done
+}
+restore_check() {
+    golden && [ "$(sha "$G/manifest")" = "$1" ] && [ "$oid" = "$2" ] || return 20
+    [ ! -e "$P/auth.recovery.stage" ] && [ ! -L "$P/auth.recovery.stage" ] || return 20
+    runtime_safe && known_entries "$A" "$WORK_FILES $RUNTIME_FILES stdin" &&
+        known_entries "$G" "$FILES manifest manifest.sha256" || return 20
+    for name in $FILES; do
+        path=$A/$name
+        [ "$name" != boot-entry ] || path=$B
+        valid_file "$path" "$(mode "$name")" "$(expected "$name")" || return 20
+    done
+    for name in supervisor.identity injector.identity target.identity; do
+        if [ -f "$A/$name" ]; then
+            saved=$(cat "$A/$name")
+            set -- $saved
+            [ "$#" = 3 ] || return 20
+            case "$1$2" in *[!0-9]*) return 20;; esac
+            [ "${#3}" = 64 ] && ! echo "$3" | grep -q '[^a-f0-9]' || return 20
+            if [ -e "/proc/${saved%% *}" ]; then same "$saved" || return 20; fi
+        fi
+    done
+    if [ -e "$P/auth.lock" ]; then
+        exec 9< "$P/auth.lock"
+        if ! "$BB" flock -n 9; then
+            regular "$A/supervisor.identity" 600 && same "$(cat "$A/supervisor.identity")" || return 20
+        fi
+    fi
+    injector=
+    if [ -f "$A/injector.identity" ]; then injector=$(cat "$A/injector.identity"); fi
+    no_other_injector || return 20
+    return 10
 }
 remove() {
     absent && { uninstalled; return 0; }
@@ -427,7 +456,7 @@ main() {
             fi
             case "$1" in
                 check) check; return $?;;
-                restore-check) return 20;;
+                restore-check) restore_check "$2" "$3"; return $?;;
             esac;;
     esac
     private_dir "$P" && [ -d "${B%/*}" ] || return 20

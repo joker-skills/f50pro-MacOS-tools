@@ -135,13 +135,16 @@ class AuthHostTest(unittest.TestCase):
     def test_restore_check_binds_valid_backup_before_read_only_device_query(self):
         state = host.auth_state(self.args)
         host.auth_backup(state, self.args, self.files())
-        for code in (0, 20):
+        for code in (0, 10, 20, 127):
             output = io.StringIO()
             with patch.object(host, "auth_service", return_value=SimpleNamespace(returncode=code)) as service, \
                     contextlib.redirect_stdout(output):
-                self.assertEqual(host.auth_restore_check(self.args, object()), code)
-            self.assertEqual(service.call_args.args[1], "restore-check")
+                self.assertEqual(host.auth_restore_check(self.args, object()), code if code in (0, 10) else 20)
+            expected = hashlib.sha256(self.files()["manifest"]).hexdigest()
+            self.assertEqual(service.call_args.args[1], "restore-check " + expected + " " + self.args.source_oid)
             self.assertEqual(json.loads(output.getvalue())["restored"], code == 0)
+            self.assertEqual(json.loads(output.getvalue())["state"],
+                             {0: "uninstalled", 10: "deployed"}.get(code, "unconfirmed"))
         (state / "source_oid").write_text("bad")
         with patch.object(host, "auth_service") as service:
             with self.assertRaises(host.OperationError):
@@ -206,10 +209,12 @@ class AuthShellTest(unittest.TestCase):
         self.script = self.script.replace("/data/adb/service.d/f50-auth-hook.sh", str(self.boot))
         self.script = self.script.replace("/proc/", str(self.proc) + "/")
         self.script = self.script.replace("/system/bin/getprop", "getprop")
+        self.script = self.script.replace("/system/bin/pidof", "pidof")
+        self.pids = {"com.zte.web": [], "frida-inject": []}
         self.script = self.script.replace(host.AUTH_INJECTOR_SHA, hashlib.sha256(files["frida-inject"]).hexdigest())
-        # Native I/O and hashes; only Linux stat spelling/root UID are simulated on macOS.
+        # Native I/O and hashes; explicit pidof candidates and Linux stat/root UID fixtures.
         helper = self.root / "tools.py"
-        helper.write_text('''import fcntl, hashlib, os, sys
+        helper.write_text('''import fcntl, hashlib, json, os, sys
 if sys.argv[1] == "stat":
     s = os.stat(sys.argv[-1]); fmt = sys.argv[3]
     for k, v in {"%u": "0", "%a": oct(s.st_mode & 0o777)[2:], "%i": str(s.st_ino),
@@ -222,9 +227,14 @@ elif sys.argv[1] == "hash":
 elif sys.argv[1] == "flock":
     try: fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError: sys.exit(1)
+elif sys.argv[1] == "pidof":
+    values = json.load(open(sys.argv[2]))[sys.argv[3]]
+    print(" ".join(map(str, values)))
+    sys.exit(0 if values else 1)
 ''')
         self.script += f'\nstat() {{ python3 {shlex.quote(str(helper))} stat "$@"; }}\n'
         self.script += f'sha256sum() {{ python3 {shlex.quote(str(helper))} hash "$@"; }}\n'
+        self.script += f'pidof() {{ python3 {shlex.quote(str(helper))} pidof {shlex.quote(str(self.root / "pidof.json"))} "$@"; }}\n'
         busybox = self.root / "busybox"
         busybox.write_text('#!/bin/sh\nif [ "$1" = tar ]; then shift; exec tar "$@"; fi\n' +
                            f'exec python3 {shlex.quote(str(helper))} "$@"\n')
@@ -232,6 +242,7 @@ elif sys.argv[1] == "flock":
         self.script += f'BB={shlex.quote(str(busybox))}\nsleep() {{ :; }}\n'
 
     def shell(self, commands, expected=0):
+        (self.root / "pidof.json").write_text(json.dumps(self.pids))
         result = subprocess.run(["sh", "-c", self.script + "\n" + commands], capture_output=True, timeout=20)
         self.assertEqual(result.returncode, expected, result.stderr.decode())
         return result.stdout.decode()
@@ -294,6 +305,7 @@ elif sys.argv[1] == "flock":
         self.assertEqual(outside.read_bytes(), b"untouched")
 
     def test_identity_rejects_pid_reuse_and_ambiguous_full_target_cmdline(self):
+        self.pids["com.zte.web"] = [123]
         self.make_process(123, 456, b"com.zte.web\0")
         identity = self.shell("identity 123").strip()
         self.assertEqual(self.shell("target").strip(), identity)
@@ -301,9 +313,11 @@ elif sys.argv[1] == "flock":
         self.shell(f"same {shlex.quote(identity)}", 1)
         self.shell(f"injector={shlex.quote(identity)}; natural_exit", 20)
         self.make_process(124, 12, b"com.zte.web\0extra\0")
+        self.pids["com.zte.web"] = [123, 124]
         self.shell("target", 20)
 
     def test_target_accepts_android_nul_padding_but_rejects_extra_arguments_and_prefix(self):
+        self.pids["com.zte.web"] = [123]
         raw = b"com.zte.web" + b"\0" * 80
         self.make_process(123, 456, raw)
         identity = self.shell("target").strip()
@@ -313,9 +327,13 @@ elif sys.argv[1] == "flock":
             self.shell("target", 20)
         for command in (b"com.zte.web.extra\0", b"com.zte.web-helper\0"):
             self.make_process(123, 456, command)
+            self.pids["com.zte.web"] = []
             self.shell("target", 10)
+            self.pids["com.zte.web"] = [123]
+            self.shell("target", 20)
         self.make_process(123, 456, raw)
         self.make_process(124, 999, b"com.zte.web\0\0")
+        self.pids["com.zte.web"] = [123, 124]
         self.shell("target", 20)
 
     def test_boot_and_missing_target_wait_without_spending_injection_budget(self):
@@ -349,7 +367,8 @@ run; echo "failures=$failures"''')
             archive.write_bytes(host.auth_archive(files))
             self.shell(f'start() {{ heal; }}; main install {sha} < {shlex.quote(str(archive))}')
             self.assertEqual((self.work / "source_oid").read_text(), oid + "\n")
-            self.shell("main restore-check", 20)
+            self.shell(f'main restore-check {sha} {oid}', 10)
+            self.shell(f'main restore-check {first_sha} {"f" * 40}', 20)
             self.shell("main check", 20)
             if oid.startswith("a"):
                 self.shell(f'main remove {sha} {oid}')
@@ -405,11 +424,16 @@ run; echo "failures=$failures"''')
         self.shell("main restore-check", 20)
         stage.rmdir()
         self.make_process(333, 444, b"/private/frida-inject\0")
+        self.pids["frida-inject"] = [333]
         self.shell("main check", 20)
         self.shell("main restore-check", 20)
         (self.proc / "333/cmdline").write_bytes(str(self.golden / "auth-service.sh").encode() + b"\0run\0")
-        self.shell("main check", 20)
-        self.shell("main restore-check", 20)
+        self.pids["frida-inject"] = []
+        # A real supervisor is identified by its held lock, even without assets.
+        with (self.parent / "auth.lock").open("w") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.shell("main check", 20)
+            self.shell("main restore-check", 20)
 
     def test_stale_wrong_session_wrong_pid_and_false_probes_are_rejected(self):
         self.shell("heal")
@@ -427,6 +451,7 @@ run; echo "failures=$failures"''')
         self.shell(prefix + "wait_event probe-passed true ',\"returned\":false'")
 
     def test_other_injector_refused_and_duplicate_supervisor_cannot_enter(self):
+        self.pids["frida-inject"] = [333]
         self.make_process(333, 444, b"/private/frida-inject\0")
         self.shell("injector=; no_other_injector", 20)
         lock = self.parent / "auth.lock"
@@ -434,6 +459,80 @@ run; echo "failures=$failures"''')
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.shell("run", 20)
         self.assertFalse((self.work / "supervisor.identity").exists())
+
+    def test_pidof_candidates_keep_identity_and_executable_checks(self):
+        self.pids["com.zte.web"] = [123]
+        self.make_process(123, 456, b"com.zte.web\0")
+        # Unrelated /proc entries must not become candidate processes.
+        for pid in range(1000, 1476):
+            (self.proc / str(pid)).mkdir()
+        self.assertTrue(self.shell("target").startswith("123 456 "))
+        self.shell("pidof() { return 127; }; target", 20)
+        self.shell("pidof() { return 127; }; no_other_injector", 20)
+        self.pids["frida-inject"] = [333]
+        self.make_process(333, 444, b"/private/frida-inject\0", str(self.work / "frida-inject"))
+        owned = self.shell("identity 333").strip()
+        self.shell(f'injector={shlex.quote(owned)}; no_other_injector')
+        (self.proc / "333/exe").unlink()
+        (self.proc / "333/exe").symlink_to("/unknown/frida-inject")
+        self.shell(f'injector={shlex.quote(owned)}; no_other_injector', 20)
+        self.make_process(333, 999, b"/private/frida-inject\0")
+        self.shell(f'injector={shlex.quote(owned)}; no_other_injector', 20)
+
+    def test_restore_query_preserves_known_deployment_and_rejects_unknowns(self):
+        self.shell("heal")
+        expected = hashlib.sha256((self.golden / "manifest").read_bytes()).hexdigest()
+        query = f'main restore-check {expected} {"a" * 40}'
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                  for directory in (self.work, self.golden, self.boot.parent)
+                  for p in directory.iterdir()}
+        self.shell(query, 10)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
+        with (self.parent / "auth.lock").open("w") as stream:
+            os.chmod(stream.name, 0o600)
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.shell(query, 20)
+            self.make_process(555, 666, str(self.golden / "auth-service.sh").encode() + b"\0run\0")
+            supervisor = self.work / "supervisor.identity"
+            supervisor.write_text(self.shell("identity 555").strip())
+            supervisor.chmod(0o600)
+            self.shell(query, 10)
+            self.make_process(555, 777, b"unrelated\0")
+            self.shell(query, 20)
+            supervisor.unlink()
+        self.make_process(123, 456, b"com.zte.web\0")
+        recorded = self.shell("identity 123").strip()
+        (self.work / "target.identity").write_text(recorded)
+        (self.work / "target.identity").chmod(0o600)
+        self.shell(query, 10)
+        self.make_process(123, 999, b"com.zte.web\0")
+        self.shell(query, 20)
+        (self.work / "target.identity").write_text("unknown identity")
+        self.shell(query, 20)
+        (self.work / "target.identity").unlink()
+        (self.parent / "auth.recovery.stage").mkdir(mode=0o700)
+        self.shell(query, 20)
+        (self.parent / "auth.recovery.stage").rmdir()
+        (self.work / "auth-hook.bundle.js").write_bytes(b"broken")
+        self.shell(query, 20)
+        self.assertEqual((self.work / "auth-hook.bundle.js").read_bytes(), b"broken")
+
+    def test_supervisor_and_injector_can_write_larger_than_agent_limit(self):
+        self.shell("heal")
+        payload = self.root / "large-file"
+        writer = self.root / "writer.sh"
+        writer.write_text('#!/bin/sh\nexec python3 -c ' + shlex.quote(
+            f'from pathlib import Path; Path({str(payload)!r}).write_bytes(b"x" * 262144)') + '\n')
+        writer.chmod(0o700)
+        self.shell(f'BB={shlex.quote(str(writer))}; start; wait')
+        self.assertEqual(payload.stat().st_size, 262144)
+        payload.unlink()
+        injector = self.work / "frida-inject"
+        injector.write_bytes(writer.read_bytes())
+        injector.chmod(0o700)
+        self.shell('getprop() { echo 1; }; target() { echo "123 456 hash"; }; '
+                   'heal() { :; }; launch; result=$?; wait; exit "$result"', 20)
+        self.assertEqual(payload.stat().st_size, 262144)
 
     def test_manual_disable_never_launches_and_natural_failure_retries_are_bounded(self):
         self.shell("heal; launch() { echo launched > \"$A/launched\"; return 20; }; run")
