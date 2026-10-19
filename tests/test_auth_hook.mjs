@@ -26,11 +26,15 @@ function fixture(processName = 'com.zte.web', returnType = 'boolean', options = 
       assert.equal(parameters[0], contextClass);
       return {
       setAccessible() {},
-      invoke: (_receiver, args) => ({ booleanValue: () => {
+      invoke: (receiver, args) => {
+        assert.equal(receiver, null);
+        assert.equal(args.length, 1);
+        assert.equal(args[0], null);
+        return { booleanValue: () => {
         if (options.probe === 'true') return true;
         if (options.probe === 'no-hit') return false;
         return method.implementation(...args);
-      } })
+      } }; }
     }; } }
   };
   const types = {

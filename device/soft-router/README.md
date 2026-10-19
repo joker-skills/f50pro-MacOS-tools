@@ -205,6 +205,7 @@ npm install --no-audit --no-fund frida-java-bridge@7.0.13 frida-compile@19.1.0
 [Frida 官方发布](https://github.com/frida/frida/releases/tag/17.24.2) 取得，并核验发布摘要。
 将工具和 bundle 放到设备仅 root 可访问的任务目录；核对目标 PID 后，以 root 执行
 `frida-inject -p <PID> -i -s <bundle绝对路径>`。不启动 Frida Server，不增加监听端口。
+本地验证除原 Python 测试外还须运行 `node --test tests/test_auth_hook.mjs`，只需 Node 内置 test runner，无 npm 测试依赖。
 
 使用注入器交互模式 `-i`，不要使用无法按此入口撤销的 `--eternalize`。
 脚本支持输入 `status`、`probe`、`restore` 和 `apply`；`restore` 恢复原函数，
