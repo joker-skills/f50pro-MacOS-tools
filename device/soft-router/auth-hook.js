@@ -59,9 +59,12 @@ rpc.exports = {
           apply();
           resolve();
         } catch (error) {
-          restore();
-          report('failed', { reason: String(error) });
-          reject(error);
+          let failure = error;
+          try { restore(); } catch (restoreError) {
+            failure = new Error('Restoration failed: ' + String(restoreError));
+          }
+          report('failed', { reason: String(failure) });
+          reject(failure);
         }
       });
     });
