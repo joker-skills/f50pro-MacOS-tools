@@ -19,6 +19,10 @@ import time
 ROOT = "/data/adb/f50-soft-router"
 BOOT = "/data/adb/service.d/f50-soft-router.sh"
 HERE = Path(__file__).resolve().parent
+AUTH = ROOT + "/auth"
+AUTH_INJECTOR_SHA = "5358e6397ac5983c767b2137d4dd3e1f20af70f401d93075c99c846c7f09fe2c"
+# frida-compile 19.1.0 + frida-java-bridge 7.0.13, rebuilt from auth-hook.js.
+AUTH_BUNDLE_SHA = "9b2de68a79ceef8fb12581a9adf458da67f2f911c93dd30dcc53a10838be857c"
 
 
 class OperationError(ValueError, RuntimeError):
@@ -474,16 +478,185 @@ def updates_remove(args, device):
     return 0
 
 
+def auth_service(device, action, *, data=None):
+    script = (HERE / "auth-service.sh").read_text()
+    return device.shell("/data/adb/magisk/busybox ash -c " + shlex.quote(script) +
+                        " -- " + action, data=data)
+
+
+def auth_state(args):
+    if not args.state_dir or not re.fullmatch(r"[0-9a-f]{40}", args.source_oid or ""):
+        raise OperationError("Auth install/remove/restore-check require --state-dir and a full --source-oid")
+    state = Path(args.state_dir)
+    if not state.is_absolute() or any(p.is_symlink() for p in [state, *state.parents]):
+        raise OperationError("Auth state directory must be absolute without symlinks")
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not state.is_dir() or state.stat().st_uid != os.getuid() or state.stat().st_mode & 0o777 != 0o700:
+        raise OperationError("Auth state directory must be owned by this user with mode 0700")
+    return state
+
+
+def auth_archive(files):
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        for name, content in files.items():
+            item = tarfile.TarInfo(name)
+            item.size = len(content)
+            item.mode = 0o700 if name in {"frida-inject", "auth-service.sh", "boot-entry"} else 0o600
+            archive.addfile(item, io.BytesIO(content))
+    return stream.getvalue()
+
+
+def auth_backup(state, args, files):
+    record = {"serial": args.serial, "source_oid": args.source_oid,
+              "sha256": {n: hashlib.sha256(b).hexdigest() for n, b in files.items()}}
+    journal = state / "auth.json"
+    if journal.exists() or journal.is_symlink():
+        previous, saved_files = auth_read_backup(state, args)
+        if previous != record or saved_files != files:
+            raise OperationError("Auth state contains a different backup; refusing overwrite")
+        return record
+    if any(state.iterdir()):
+        raise OperationError("New auth state directory must be empty")
+    for name, content in files.items():
+        fd = os.open(state / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+    # Complete the local recovery set before any device mutation.
+    private_write(journal, record)
+    return record
+
+
+def auth_read_backup(state, args):
+    names = {"frida-inject", "auth-hook.bundle.js", "auth-service.sh", "boot-entry",
+             "source_oid", "manifest", "manifest.sha256"}
+    journal = state / "auth.json"
+    if journal.is_symlink() or not journal.is_file() or journal.stat().st_mode & 0o077:
+        raise OperationError("Missing or non-private auth backup journal")
+    record = json.loads(journal.read_text())
+    if (not isinstance(record, dict) or not isinstance(record.get("sha256"), dict) or
+            record.get("serial") != args.serial or record.get("source_oid") != args.source_oid or
+            set(record.get("sha256", {})) != names):
+        raise OperationError("Auth backup belongs to a different identity or is incomplete")
+    files = {}
+    for name, sha in record["sha256"].items():
+        path = state / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077 or digest(path) != sha:
+            raise OperationError("Auth recovery file missing, unsafe or corrupt: " + name)
+        files[name] = path.read_bytes()
+    if (hashlib.sha256(files["manifest"]).hexdigest().encode() + b"\n" != files["manifest.sha256"] or
+            files["source_oid"] != (args.source_oid + "\n").encode()):
+        raise OperationError("Auth backup manifest identity differs")
+    return record, files
+
+
+def auth_install(args, device):
+    state = auth_state(args)
+    files = {}
+    for name, supplied, expected in (("frida-inject", args.injector, AUTH_INJECTOR_SHA),
+                                     ("auth-hook.bundle.js", args.bundle, AUTH_BUNDLE_SHA)):
+        if not supplied or not Path(supplied).is_absolute():
+            raise OperationError("Auth install requires absolute --injector and --bundle paths")
+        path = Path(supplied)
+        if path.is_symlink() or not path.is_file() or digest(path) != expected:
+            raise OperationError("Auth asset differs from pinned release/source bundle: " + name)
+        files[name] = path.read_bytes()
+    files["auth-service.sh"] = (HERE / "auth-service.sh").read_bytes()
+    service_sha = hashlib.sha256(files["auth-service.sh"]).hexdigest()
+    recovery = ROOT + "/auth.recovery"
+    files["boot-entry"] = (
+        "#!/data/adb/magisk/busybox ash\numask 077\n"
+        f'G={recovery}\nA={AUTH}\n'
+        '[ -d "$A" ] && [ ! -L "$A" ] && [ "$(stat -c %u:%a "$A")" = 0:700 ] || exit 20\n'
+        '[ -f "$A/enabled" ] && [ ! -L "$A/enabled" ] || exit 0\n'
+        '[ -d "$G" ] && [ ! -L "$G" ] && [ "$(stat -c %u:%a "$G")" = 0:700 ] || exit 20\n'
+        '[ -f "$G/auth-service.sh" ] && [ ! -L "$G/auth-service.sh" ] || exit 20\n'
+        f'[ "$(sha256sum "$G/auth-service.sh" | cut -d " " -f 1)" = {service_sha} ] || exit 20\n'
+        'if [ -e "$A/supervisor.log" ] || [ -L "$A/supervisor.log" ]; then\n'
+        '  [ -f "$A/supervisor.log" ] && [ ! -L "$A/supervisor.log" ] && '
+        '[ "$(stat -c %u:%a "$A/supervisor.log")" = 0:600 ] || exit 20\nfi\n'
+        '/data/adb/magisk/busybox nohup /data/adb/magisk/busybox ash "$G/auth-service.sh" run '
+        '</dev/null > "$A/supervisor.log" 2>&1 &\n'
+    ).encode()
+    files["source_oid"] = (args.source_oid + "\n").encode()
+    files["manifest"] = "".join(hashlib.sha256(b).hexdigest() + "  " + n + "\n"
+                                  for n, b in files.items()).encode()
+    manifest_sha = hashlib.sha256(files["manifest"]).hexdigest()
+    files["manifest.sha256"] = (manifest_sha + "\n").encode()
+    auth_backup(state, args, files)
+    # Auth can be used without an installed proxy. Never chmod an existing parent.
+    device.require(f"umask 077; if [ ! -e {ROOT} ] && [ ! -L {ROOT} ]; then mkdir {ROOT}; fi; "
+                   f'[ -d {ROOT} ] && [ ! -L {ROOT} ] && [ "$(stat -c %u:%a {ROOT})" = 0:700 ]')
+    result = auth_service(device, "install " + manifest_sha, data=auth_archive(files))
+    if result.returncode:
+        raise OperationError("Auth install incomplete; keep backup and device recovery material")
+    return auth_check(args, device)
+
+
+def auth_check(args, device):
+    result = auth_service(device, "check")
+    try:
+        status = json.loads(result.stdout)
+        if not isinstance(status, dict) or not isinstance(status.get("probe"), dict):
+            raise ValueError("Invalid auth status")
+    except ValueError:
+        status = {"source_oid": None, "state": "unknown", "target": None,
+                  "supervisor": None, "injector": None, "files_healthy": False, "probe": {}}
+    if result.returncode == 10 and status.get("state") == "uninstalled":
+        print(json.dumps(status, separators=(",", ":")))
+        return 10
+    healthy = (result.returncode == 0 and status.get("state") == "healthy" and
+               status.get("files_healthy") is True and status.get("probe", {}).get("passed") is True)
+    reported_source = status.get("source_oid")
+    if args.source_oid and reported_source != args.source_oid:
+        healthy = False
+        if isinstance(reported_source, str) and reported_source:
+            status["state"] = "source-mismatch"
+    status.setdefault("probe", {})["fresh"] = healthy
+    if not healthy:
+        status["probe"]["passed"] = False
+        status["files_healthy"] = False
+        if status.get("state") == "healthy":
+            status["state"] = "unconfirmed"
+    print(json.dumps(status, separators=(",", ":")))
+    return 0 if healthy else 20
+
+
+def auth_remove(args, device):
+    state = auth_state(args)
+    _, files = auth_read_backup(state, args)
+    expected = hashlib.sha256(files["manifest"]).hexdigest()
+    result = auth_service(device, "remove " + expected + " " + args.source_oid)
+    if result.returncode:
+        raise OperationError("Auth restore/detach unconfirmed; enabled revoked when possible; keep all material")
+    return 0
+
+
+def auth_restore_check(args, device):
+    state = auth_state(args)
+    _, files = auth_read_backup(state, args)
+    expected = hashlib.sha256(files["manifest"]).hexdigest()
+    result = auth_service(device, "restore-check " + expected + " " + args.source_oid)
+    restored = result.returncode == 0
+    status = {0: "uninstalled", 10: "deployed"}.get(result.returncode, "unconfirmed")
+    print(json.dumps({"source_oid": args.source_oid, "state": status,
+                      "restored": restored}, separators=(",", ":")))
+    return result.returncode if result.returncode in (0, 10) else 20
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["apply", "check", "restore", "restore-check", "login", "ts-status",
-                                                  "updates-install", "updates-check", "updates-remove"])
+                                                  "updates-install", "updates-check", "updates-remove",
+                                                  "auth-install", "auth-check", "auth-remove", "auth-restore-check"])
     parser.add_argument("--serial", required=True)
     parser.add_argument("--source-oid")
     parser.add_argument("--assets-dir")
     parser.add_argument("--private-config", help="Private central Mihomo YAML or legacy JSON")
     parser.add_argument("--geo-assets-dir", help="Optional local directory of cached Mihomo Geo assets")
     parser.add_argument("--state-dir")
+    parser.add_argument("--injector", help="Official Android ARM64 frida-inject 17.24.2 ELF")
+    parser.add_argument("--bundle", help="Pinned compiled auth-hook.bundle.js")
     parser.add_argument("--subscription-file", help="Private HTTPS F50 JSON subscription URL file")
     parser.add_argument("--transparent", action="store_true")
     parser.add_argument("--autostart", action="store_true")
@@ -495,7 +668,10 @@ def main():
                     hashlib.sha256(args.serial.encode()).hexdigest()[:16] + ".lock")
         lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if args.command == "apply":
+        if args.command.startswith("auth-"):
+            return {"auth-install": auth_install, "auth-check": auth_check,
+                    "auth-remove": auth_remove, "auth-restore-check": auth_restore_check}[args.command](args, device)
+        elif args.command == "apply":
             result = apply(args, device)
         elif args.command.startswith("updates-"):
             result = {"updates-install": updates_install, "updates-check": updates_check,

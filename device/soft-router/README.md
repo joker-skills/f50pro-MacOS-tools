@@ -216,6 +216,116 @@ npm install --no-audit --no-fund frida-java-bridge@7.0.13 frida-compile@19.1.0
 注入器或 ADB 交互会话中断也可能卸载补丁，须重新检查，不能承诺脱离会话仍生效。
 安装成功日志不代替小程序、本地管理与实际联网验收。
 
+### 设备本地认证持久化
+
+`auth-install` 是上述单方法 hook 的独立持久化入口，不是代理部署的一部分。
+仍只附加到 Android 已有的唯一 `com.zte.web`，不重启设备或厂商进程，不改 APK、
+Settings 认证 flags、云管理 APP、路由策略、Mihomo/Tailscale 或 crond。
+不使用 Frida Server、监听端口、eternalize、development 或全局 deopt。
+旧交互会话必须先明确 `restore` 并退出；检测到其它 frida-inject 时拒绝接管。
+
+认证工作目录为 `/data/adb/f50-soft-router/auth`，恢复目录为同级 `auth.recovery`，
+均为 root 0700；文件为 0600，三个可执行资产为 0700。
+唯一自启入口是 `/data/adb/service.d/f50-auth-hook.sh`，不创建 Magisk 模块，
+不读取或修改代理的 deployment.json、boot.sh、service.sh、updates.sh 或 network.sh。
+设备不需要代理、蜂窝、M5 或 ADB 保持在线；安装命令仍需 root ADB。
+
+在私有构建目录复制本候选 auth-hook.js，使用上节固定版本编译；本候选 bundle
+SHA256 为 `9b2de68a79ceef8fb12581a9adf458da67f2f911c93dd30dcc53a10838be857c`。
+官方 Android ARM64 frida-inject 17.24.2 原始 ELF SHA256 为
+`5358e6397ac5983c767b2137d4dd3e1f20af70f401d93075c99c846c7f09fe2c`，
+原始 xz 归档 SHA256 为 `bded111121355cd760df7fb64f331ca22888af47a642997d1ca4a8946db201ff`。
+CLI 接受原始 ELF 和本候选 bundle 的绝对路径，拒绝旧 bundle；二进制及 node_modules 不入 Git。
+
+以下命令中的 serial、路径和完整 OID 应替换为本次候选的实际值。state-dir 必须为绝对路径，
+整条路径不经过 symlink；目录须为当前用户所有且 0700，首次使用时为空或尚不存在。
+
+```sh
+python3 device/soft-router/host.py auth-install --serial SERIAL --injector /private/path/frida-inject --bundle /private/path/auth-hook.persist.bundle.js --state-dir /private/path/auth-state --source-oid FULL_40_HEX_OID
+python3 device/soft-router/host.py auth-check --serial SERIAL --source-oid FULL_40_HEX_OID
+python3 device/soft-router/host.py auth-remove --serial SERIAL --state-dir /private/path/auth-state --source-oid FULL_40_HEX_OID
+python3 device/soft-router/host.py auth-restore-check --serial SERIAL --state-dir /private/path/auth-state --source-oid FULL_40_HEX_OID
+```
+
+`auth-install` 在任何设备写入前保存本机 auth.json、全部资产、manifest 及其摘要。
+启动后最多等待 10 秒，确认监督器 identity 与活进程一致后才进入新鲜探针检查；
+check 同样短暂等待监督器就绪，随后最多等待 45 秒获取关联本次请求的成功探针。
+认证 source_oid 与五个工作资产摘要保存在独立恢复目录，不写代理 manifest。
+重复安装仅接受相同内容、相同 serial/OID 的备份及恢复 manifest；未知目录、入口、
+残留 staging 或不同部署拒绝覆盖，保留现场。失败后先 check/remove，不盲目重放。
+已知 manifest 仍完整时，再用同一 state-dir 和其中的 frida-inject、auth-hook.bundle.js
+作为输入重试 install，可从宿主备份修复受损 golden 文件。manifest 本身丢失、损坏或
+身份不同则拒绝自动覆盖，需人工核实并恢复该完整备份，不能用工作文件重建 baseline。
+
+一个 BusyBox ash 循环持有独立 auth.lock，最多管理一个注入器。目标、监督器和
+注入器记录 PID、内核 starttime 与完整 cmdline SHA256。目标首参数必须精确为
+`com.zte.web`，后面只允许 Android 的 NUL 填充；摘要记录原始完整字节，不能与一个
+固定字符串的摘要比较。额外参数、同前缀进程、多目标或 PID 复用均不能通过目标确认。
+注入器另核对 executable 路径。
+目标和注入器用 Android 的精确 `pidof com.zte.web` / `pidof frida-inject` 查询候选，
+仅核验候选的完整身份；监督器存活由其独占 auth.lock 和已记录身份确认，不逐 PID 扫描。
+不承诺检测 root 改名隐藏的注入器。
+私有 FIFO 以 RDWR 打开保持 stdin，注入器仅继承 fd 0，关闭监督锁和原 FIFO fd。
+每次新注入必须收到本会话 installed，再收到带新 nonce 的 probe-passed；之后每 30 秒
+反射调用必须返回 false 且命中计数恰好 +1。check 会要求额外的新鲜探针，不复用旧日志。
+没有 installed 或新鲜回复，即使进程活着也报告异常，不继续叠加会话。
+
+持久化 init 使用 `-P '{"flush":true,"session":"..."}'`，回复带 session、nonce 和
+目标 PID，经 `send(['frida:stdout', JSON.stringify(message)+'\n'])` 刷新 stdout。
+默认 init 和无 nonce 的交互命令仍兼容原有 send 对象。
+依据为 [官方 17.24.2 injector 源码](https://github.com/frida/frida-core/blob/17.24.2/inject/inject.vala)：
+普通 JSON 输出可能缓冲，且 init 异常会被吞掉，故不能只看 injector 退出码。
+
+循环每 30 秒及 check 时验证小资产、工作目录、恢复副本和 boot 入口，
+缺失、损坏、symlink 或权限错误的工作文件从验证过的 golden 原子替换；未知目录类型拒绝。
+磁盘恢复不会重新注入当前 hook，enabled 从不在恢复名单中。
+84 MB ELF 在启动、重新注入、元数据变化时完整 hash；轮询复用 inode/size/mtime/ctime/
+uid/mode 指纹，避免每 30 秒读两份 ELF。这不是 root 防篡改机制，同秒同长度且元数据不变的
+恶意改写不在保证范围内。恢复副本任何校验失败立即停止恢复并报告，不反向采信工作文件。
+hook 不逐业务调用写日志，session.log 每次请求前清空，正常监督循环没有持续输出，
+致命错误退出。不设置文件大小 ulimit：该限制同样作用于 Frida 的 memfd，会阻止加载 agent。
+
+仅在确认直接子进程已消失或为原 starttime 的 zombie 后，才允许每隔至少 30 秒重试，
+连续三次失败停止；健康探针成功后重置计数。新注入前每隔至少 30 秒确认
+`sys.boot_completed=1` 和唯一目标；启动未完成或目标未出现时不消耗注入失败预算，
+check 请求也不加快这段等待，不拉起目标或依赖网络。
+活进程 probe 失败、身份不明、restore 失败都保留材料并报告，绝不把它写成 active=false。
+监督器自身退出没有第二个守护器重拉，需人工检查后恢复或等待下次自然开机。
+
+`auth-check` 只输出一个小型 JSON，包含 source_oid、target/supervisor/injector identity、
+本次 probe 的 nonce/passed/fresh 和 files_healthy。退出 0 表示本次检查健康；
+10 表示工作目录、golden、自启入口及 staging 均不存在，也没有注入器或本认证监督器，
+输出 state=uninstalled；部分资产、身份不明或不健康返回 20。
+旧状态只能作为线索，失败检查的 probe 不会标记 fresh/passed。
+无状态或损坏 JSON 保持 unknown，只有读到明确不同的 source_oid 才标记 source-mismatch。
+`auth-remove` 先撤销 enabled；收到关联本次请求的 restored/active=false 后才向自己的
+注入器发 SIGTERM，由官方实现 detach，不杀厂商进程。监督器已退出但身份和 FIFO 完整时
+可按同一协议尝试撤销遗留的自有会话；未知状态保留文件并返回 20。
+确认 restore/detach、监督器和注入器结束、自启入口撤销后，校验宿主备份绑定的
+manifest/source_oid、目录和文件集合，仅用逐个 rm 与 rmdir 清理本版设备认证工作资产
+和 golden；M5 state-dir 的完整备份保留，不触碰代理根目录其它内容、APK 或认证配置备份。
+未知文件、子目录、symlink、staging 或资产摘要不同会拒绝清理并保留材料，返回 20；
+清理中断后的未知残留也需核实，不递归删除或跳过来源守卫。
+已确认无资产时，同一有效备份绑定的重复 remove 返回 0，不要求已删除的 golden 再出现。
+独立 auth.lock/auth.control.lock 普通锁文件保留，未持锁时不算已部署资产。
+主动停用不会被文件恢复重拉，重新启用需显式 install。remove 不会撤销旧云端配置。
+
+`auth-restore-check` 必须先成功加载同一 serial/source_oid/state-dir 的有效宿主备份，
+再只读确认工作目录、golden、自启入口、staging 和本认证进程均不存在；全部确认返回 0，
+同一备份的 manifest/source_oid、设备资产及已有进程身份均确认而仍部署时返回 10，
+异常、损坏或身份未知返回 20。查询不在设备上创建或截断锁文件，不恢复文件或发送信号。
+候选 A 试验结束后，用 A 的备份执行 remove → restore-check；确认干净后，正式交付
+用新的 state-dir 和真实 merge OID 执行 install → check。不能改写旧 source_oid 冒充
+merge OID；安装不同 manifest 的守卫保持有效。
+
+局部验证命令为 `node --test tests/test_auth_hook.mjs`、
+`python3 -m unittest discover -s tests -p test_auth_service.py -v` 和
+`sh -n device/soft-router/auth-service.sh`。shell fixture 仅模拟 Linux proc/stat/root UID；
+不代表设备 BusyBox、官方注入器或 Android ART 的真实验收。
+候选必须由宿主再验证真实 FIFO 与 FD 继承、restore/detach、脱离 ADB、工作文件损坏恢复、
+自然目标进程重启及真实开机。本地 fixture 不验证后两项；主动重启设备或厂商进程
+须取得当次明确授权，不能沿用历史重启许可。
+
 部署思路参考 Tai1win10c/zte-f50pro-macos-toolkit，本目录独立实现，未复制其源码或镜像。
 二进制来自官方 MetaCubeX/mihomo Android arm64 与 Tailscale Linux arm64 release；
 版本和摘要见 artifacts.json。上游许可随其官方发布适用；本仓不分发二进制。
