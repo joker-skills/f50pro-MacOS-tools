@@ -284,6 +284,15 @@ run() {
         sleep 1; tick=$((tick + 1))
     done
 }
+wait_supervisor() {
+    ready_wait=0
+    while :; do
+        regular "$A/enabled" 600 || return 20
+        if regular "$A/supervisor.identity" 600 && same "$(cat "$A/supervisor.identity")"; then return 0; fi
+        [ "$ready_wait" -lt 10 ] || return 20
+        sleep 1; ready_wait=$((ready_wait + 1))
+    done
+}
 start() {
     heal || return 20
     runtime_safe || return 20
@@ -294,10 +303,11 @@ start() {
     : > "$A/enabled"
     # One detached supervisor; neither the injector nor launcher holds its lock.
     ( exec "$BB" nohup "$BB" ash "$G/auth-service.sh" run </dev/null > "$A/supervisor.log" 2>&1 8>&- 9>&- ) &
+    wait_supervisor
 }
 check() {
     runtime_safe || return 20
-    if ! regular "$A/supervisor.identity" 600 || ! same "$(cat "$A/supervisor.identity")"; then
+    if ! wait_supervisor; then
         [ ! -f "$A/status.json" ] || cat "$A/status.json"
         return 20
     fi

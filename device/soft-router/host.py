@@ -607,15 +607,17 @@ def auth_check(args, device):
         return 10
     healthy = (result.returncode == 0 and status.get("state") == "healthy" and
                status.get("files_healthy") is True and status.get("probe", {}).get("passed") is True)
+    reported_source = status.get("source_oid")
+    if args.source_oid and reported_source != args.source_oid:
+        healthy = False
+        if isinstance(reported_source, str) and reported_source:
+            status["state"] = "source-mismatch"
     status.setdefault("probe", {})["fresh"] = healthy
     if not healthy:
         status["probe"]["passed"] = False
         status["files_healthy"] = False
         if status.get("state") == "healthy":
             status["state"] = "unconfirmed"
-    if args.source_oid and status.get("source_oid") != args.source_oid:
-        healthy = False
-        status["state"] = "source-mismatch"
     print(json.dumps(status, separators=(",", ":")))
     return 0 if healthy else 20
 

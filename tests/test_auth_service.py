@@ -100,15 +100,21 @@ class AuthHostTest(unittest.TestCase):
                     self.assertNotIn("soft-router.sh", boot)
                     self.assertIn("auth-service.sh", boot)
                     self.assertIn("nohup", boot)
-            return SimpleNamespace(returncode=0)
+            status = {"source_oid": self.args.source_oid, "state": "healthy",
+                      "files_healthy": True, "probe": {"passed": True, "nonce": "fresh"}}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(status).encode())
 
+        output = io.StringIO()
         with patch.object(host, "AUTH_INJECTOR_SHA", hashlib.sha256(files["frida-inject"]).hexdigest()), \
                 patch.object(host, "AUTH_BUNDLE_SHA", hashlib.sha256(files["auth-hook.bundle.js"]).hexdigest()), \
-                patch.object(host, "auth_service", side_effect=service), patch.object(host, "auth_check", return_value=0):
+                patch.object(host, "auth_service", side_effect=service), contextlib.redirect_stdout(output):
             self.assertEqual(host.auth_install(self.args, Device()), 0)
             self.assertEqual(host.auth_install(self.args, Device()), 0)
             self.assertEqual(host.auth_remove(self.args, Device()), 0)
         self.assertTrue((self.state / "auth.json").is_file())
+        self.assertEqual(calls.count("check"), 2)
+        for line in output.getvalue().splitlines():
+            self.assertTrue(json.loads(line)["probe"]["fresh"])
         self.assertTrue(any(c.startswith("remove ") and c.endswith(" " + self.args.source_oid) for c in calls))
 
     def test_check_does_not_call_stale_probe_fresh(self):
@@ -160,11 +166,25 @@ class AuthHostTest(unittest.TestCase):
                     contextlib.redirect_stdout(output):
                 self.assertEqual(host.auth_check(self.args, object()), 20)
             self.assertFalse(json.loads(output.getvalue())["probe"]["fresh"])
+            self.assertEqual(json.loads(output.getvalue())["state"], "unknown")
         state = host.auth_state(self.args)
         host.auth_backup(state, self.args, self.files())
         (state / "auth.json").write_text("[]")
         with self.assertRaises(host.OperationError):
             host.auth_read_backup(state, self.args)
+
+    def test_check_distinguishes_missing_source_from_a_real_mismatch(self):
+        for source in (None, "", [], "b" * 40):
+            status = {"source_oid": source, "state": "healthy", "files_healthy": True,
+                      "probe": {"passed": True}}
+            output = io.StringIO()
+            with patch.object(host, "auth_service", return_value=SimpleNamespace(
+                    returncode=0, stdout=json.dumps(status).encode())), contextlib.redirect_stdout(output):
+                self.assertEqual(host.auth_check(self.args, object()), 20)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["state"], "source-mismatch" if source == "b" * 40 else "unconfirmed")
+            self.assertFalse(report["probe"]["fresh"])
+            self.assertFalse(report["probe"]["passed"])
 
     def test_cli_auth_arguments_route_to_auth_without_adb(self):
         for command, function in (("auth-install", "auth_install"), ("auth-check", "auth_check"),
@@ -524,7 +544,7 @@ run; echo "failures=$failures"''')
         writer.write_text('#!/bin/sh\nexec python3 -c ' + shlex.quote(
             f'from pathlib import Path; Path({str(payload)!r}).write_bytes(b"x" * 262144)') + '\n')
         writer.chmod(0o700)
-        self.shell(f'BB={shlex.quote(str(writer))}; start; wait')
+        self.shell(f'BB={shlex.quote(str(writer))}; start; result=$?; wait; exit "$result"', 20)
         self.assertEqual(payload.stat().st_size, 262144)
         payload.unlink()
         injector = self.work / "frida-inject"
@@ -533,6 +553,38 @@ run; echo "failures=$failures"''')
         self.shell('getprop() { echo 1; }; target() { echo "123 456 hash"; }; '
                    'heal() { :; }; launch; result=$?; wait; exit "$result"', 20)
         self.assertEqual(payload.stat().st_size, 262144)
+
+    def test_start_then_immediate_check_waits_for_identity_and_fresh_probe(self):
+        self.make_process(555, 666, b"auth-supervisor\0")
+        supervisor = self.shell("identity 555").strip()
+        for entry in ("start && check", "check"):
+            for name in ("supervisor.identity", "status.json", "check.request", "enabled"):
+                (self.work / name).unlink(missing_ok=True)
+            output = self.shell(f'''heal; : > "$A/enabled"; waits=0;
+nonce_new() {{ printf '%032d' 1; }};
+sleep() {{
+    waits=$((waits + 1));
+    if [ "$waits" = 2 ]; then printf '%s\\n' {shlex.quote(supervisor)} > "$A/supervisor.identity"; fi
+    if [ -f "$A/check.request" ]; then
+        request=$(cat "$A/check.request"); oid=$(cat "$G/source_oid");
+        supervisor={shlex.quote(supervisor)}; passed=true; files_ok=true;
+        write_status healthy;
+    fi
+}};
+{entry} || exit $?;
+[ "$waits" = 3 ] || exit 99''')
+            report = json.loads(output)
+            self.assertEqual(report["state"], "healthy")
+            self.assertEqual(report["probe"], {"nonce": "0" * 31 + "1", "passed": True})
+            self.assertEqual(report["supervisor"]["pid"], 555)
+
+    def test_supervisor_wait_is_bounded_and_manual_disable_is_preserved(self):
+        output = self.shell('''waits=0; sleep() { waits=$((waits + 1)); };
+start; result=$?; echo "$waits"; exit "$result"''', 20)
+        self.assertEqual(output.strip(), "10")
+        (self.work / "enabled").unlink()
+        self.shell('sleep() { echo unexpected-wait; }; check', 20)
+        self.assertFalse((self.work / "enabled").exists())
 
     def test_manual_disable_never_launches_and_natural_failure_retries_are_bounded(self):
         self.shell("heal; launch() { echo launched > \"$A/launched\"; return 20; }; run")

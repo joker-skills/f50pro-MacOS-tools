@@ -248,6 +248,8 @@ python3 device/soft-router/host.py auth-restore-check --serial SERIAL --state-di
 ```
 
 `auth-install` 在任何设备写入前保存本机 auth.json、全部资产、manifest 及其摘要。
+启动后最多等待 10 秒，确认监督器 identity 与活进程一致后才进入新鲜探针检查；
+check 同样短暂等待监督器就绪，随后最多等待 45 秒获取关联本次请求的成功探针。
 认证 source_oid 与五个工作资产摘要保存在独立恢复目录，不写代理 manifest。
 重复安装仅接受相同内容、相同 serial/OID 的备份及恢复 manifest；未知目录、入口、
 残留 staging 或不同部署拒绝覆盖，保留现场。失败后先 check/remove，不盲目重放。
@@ -295,6 +297,7 @@ check 请求也不加快这段等待，不拉起目标或依赖网络。
 10 表示工作目录、golden、自启入口及 staging 均不存在，也没有注入器或本认证监督器，
 输出 state=uninstalled；部分资产、身份不明或不健康返回 20。
 旧状态只能作为线索，失败检查的 probe 不会标记 fresh/passed。
+无状态或损坏 JSON 保持 unknown，只有读到明确不同的 source_oid 才标记 source-mismatch。
 `auth-remove` 先撤销 enabled；收到关联本次请求的 restored/active=false 后才向自己的
 注入器发 SIGTERM，由官方实现 detach，不杀厂商进程。监督器已退出但身份和 FIFO 完整时
 可按同一协议尝试撤销遗留的自有会话；未知状态保留文件并返回 20。
