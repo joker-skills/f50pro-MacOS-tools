@@ -2,6 +2,12 @@
 BB=/data/adb/magisk/busybox
 BOOT=/data/adb/service.d/f50-soft-router.sh
 CRON_LINE="0 */2 * * * $BB ash $ROOT/service.sh update"
+cron_contents() {
+    printf '%s\n' "$CRON_LINE"
+    if [ -f recovery.enabled ]; then
+        printf '%s\n' "* * * * * $BB ash $ROOT/service.sh recovery-tick >/dev/null 2>&1"
+    fi
+}
 private_root() {
     [ ! -L "$ROOT" ] && [ "$(stat -c %u:%a "$ROOT")" = 0:700 ]
 }
@@ -124,7 +130,7 @@ cron_owned() {
 schedule() {
     [ -f updates.enabled ] || return 0
     mkdir -p cron || return 1
-    printf '%s\n' "$CRON_LINE" > cron/root.new || return 1
+    cron_contents > cron/root.new || return 1
     if ! cmp -s cron/root.new cron/root; then
         mv cron/root.new cron/root || return 1
     else rm cron/root.new || return 1
@@ -162,7 +168,7 @@ updates_check() {
     [ "$(sha config.json)" = "$(status_value config_sha256)" ] || return 20
     [ "$(sha runtime.json)" = "$(status_value runtime_sha256)" ] || return 20
     cron_owned || return 20
-    [ "$(cat cron/root)" = "$CRON_LINE" ] || return 20
+    [ "$(cat cron/root)" = "$(cron_contents)" ] || return 20
     identity=$(identities) || return 20
     verify_loaded runtime.json || return 20
 }
@@ -306,7 +312,7 @@ cleanup_updates() {
         updates.reload-response updates-crond.log
 }
 updates_remove() {
-    private_root || return 20
+    private_root && [ ! -e recovery.sh ] && [ ! -e recovery.enabled ] || return 20
     if [ ! -e updates.backup ]; then
         [ ! -e updates.enabled ] && [ ! -e subscription.curl ] && [ ! -e updates.pending ] || return 20
         unschedule || return 20
@@ -342,6 +348,7 @@ updates_remove() {
     # Host checks the restored baseline before releasing recovery material.
 }
 updates_finalize() {
+    [ ! -e recovery.sh ] && [ ! -e recovery.enabled ] || return 20
     private_root || return 20
     if [ ! -e updates.backup ]; then
         if updates_check; then return 20; else code=$?; [ "$code" = 10 ]; return; fi

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Software-only explicit/transparent LAN proxy and userspace Tailscale."""
 import argparse
+import base64
 import fcntl
 import hashlib
 import importlib.util
@@ -201,8 +202,11 @@ def check(args, device):
     record = json.loads(device.require(f"cat {ROOT}/deployment.json"))
     updates = device.shell(f"[ -e {ROOT}/updates.enabled ] || [ -e {ROOT}/updates.backup ]")
     updating = updates.returncode == 0
-    if updating and updates_check(args, device):
-        return 20
+    effective = record
+    if updating:
+        if updates_check(args, device):
+            return 20
+        effective = recovery_effective(device, record)
     if getattr(args, "state_dir", None):
         local_path = Path(args.state_dir) / ("updates.json" if updating else "deployment.json")
         local = json.loads(local_path.read_text())
@@ -218,7 +222,7 @@ def check(args, device):
     pinned = json.loads((HERE / "artifacts.json").read_text())["sha256"]
     if record["sha256"] != pinned:
         return 20
-    if record["service_sha256"] != digest(HERE / "service.sh"):
+    if not updating and record["service_sha256"] != digest(HERE / "service.sh"):
         return 20
     config_sha = record["config_sha256"]
     if updating:
@@ -226,18 +230,18 @@ def check(args, device):
         if not re.fullmatch("[0-9a-f]{64}", config_sha):
             return 20
     expected = {**pinned, "config.json": config_sha,
-                "service.sh": record["service_sha256"]}
+                "service.sh": effective["service_sha256"]}
     for name in (("network.sh", "boot.sh", "updates.sh") if updating else ("network.sh", "boot.sh")):
-        if record["scripts_sha256"][name] != digest(HERE / name):
+        if (not updating or name == "network.sh") and record["scripts_sha256"][name] != digest(HERE / name):
             return 20
-        expected[name] = record["scripts_sha256"][name]
+        expected[name] = effective["scripts_sha256"][name]
     for name, sha in expected.items():
         got = device.require(f"sha256sum {ROOT}/{shlex.quote(name)}").decode().split()[0]
         if got != sha:
             return 20
     if record["autostart"]:
         boot_hash = device.require(f"[ -f {ROOT}/boot-enabled ] && sha256sum {BOOT}").decode().split()[0]
-        if boot_hash != record["scripts_sha256"]["boot.sh"]:
+        if boot_hash != effective["scripts_sha256"]["boot.sh"]:
             return 20
     tailscale_status(device)
     return 0
@@ -258,6 +262,7 @@ def recover_partial(device, record):
 
 
 def stop_deployment(device, record):
+    reject_recovery(device)
     try:
         device.require(f"rm -f {ROOT}/boot-enabled")
         if record.get("autostart") and device.shell(f"[ ! -e {BOOT} ] && [ ! -L {BOOT} ]").returncode != 0:
@@ -306,10 +311,12 @@ def updates_check(args, device):
     record = json.loads(device.require(f"cat {ROOT}/deployment.json"))
     if args.source_oid and record.get("source_oid") != args.source_oid:
         return 20
-    for name in ("service.sh", "boot.sh", "updates.sh"):
-        expected = record["service_sha256"] if name == "service.sh" else record["scripts_sha256"][name]
-        if expected != digest(HERE / name):
-            return 20
+    base_hashes = recovery_baseline_scripts(record)
+    if (any(sha != digest(HERE / name) for name, sha in base_hashes.items()) and
+            base_hashes != recovery_sha(recovery_source(record["source_oid"], tuple(base_hashes)))):
+        return 20
+    effective = recovery_effective(device, record)
+    for name, expected in recovery_baseline_scripts(effective).items():
         if device.require(f"sha256sum {ROOT}/{name}").decode().split()[0] != expected:
             return 20
     if getattr(args, "state_dir", None):
@@ -453,6 +460,7 @@ def verify_update_baseline(saved, state, device):
 
 
 def updates_remove(args, device):
+    reject_recovery(device)
     state = update_args(args)
     saved = json.loads((state / "updates.json").read_text())
     if saved["serial"] != args.serial or saved["source_oid"] != args.source_oid:
@@ -478,22 +486,254 @@ def updates_remove(args, device):
     return 0
 
 
+RECOVERY_SCRIPTS = ("service.sh", "updates.sh", "boot.sh", "recovery.sh")
+RECOVERY_MODES = {**dict.fromkeys((*RECOVERY_SCRIPTS, "boot-entry"), "700"),
+                  "cron-root": "600", "recovery.enabled": "600", "deployment.json": "600"}
+
+
+def recovery_baseline_scripts(record):
+    return {"service.sh": record["service_sha256"],
+            **{n: record["scripts_sha256"][n] for n in ("updates.sh", "boot.sh")}}
+
+
+def recovery_paths(autostart):
+    paths = {n: f"{ROOT}/{n}" for n in (*RECOVERY_SCRIPTS, "recovery.enabled")}
+    paths["cron-root"] = ROOT + "/cron/root"
+    if autostart:
+        paths["boot-entry"] = BOOT
+    return paths
+
+
+def reject_recovery(device):
+    result = device.shell(f"[ ! -e {ROOT}/recovery.enabled ] && [ ! -L {ROOT}/recovery.enabled ] "
+                          f"&& [ ! -e {ROOT}/recovery.sh ] && [ ! -L {ROOT}/recovery.sh ]")
+    if result.returncode:
+        raise OperationError("Remove the cellular recovery overlay first")
+
+
+def recovery_effective(device, record):
+    raw = device.require(f"if [ -e {ROOT}/recovery.enabled ] || [ -L {ROOT}/recovery.enabled ]; then "
+                         f'[ -s {ROOT}/recovery.enabled ] && [ ! -L {ROOT}/recovery.enabled ] '
+                         f'&& [ "$(stat -c %u:%a {ROOT}/recovery.enabled)" = 0:600 ] '
+                         f"&& cat {ROOT}/recovery.enabled; fi")
+    if not raw:
+        return record
+    overlay = json.loads(raw)
+    hashes = overlay["sha256"]
+    paths = recovery_paths(record["autostart"])
+    if (overlay["base_oid"] != record["source_oid"] or
+            not re.fullmatch(r"[0-9a-f]{40}", overlay["source_oid"]) or
+            set(hashes) != paths.keys() - {"recovery.enabled"}):
+        raise OperationError("Invalid cellular recovery overlay")
+    device.require(recovery_file_guard({n: paths[n] for n in hashes}, hashes))
+    if record["autostart"] and hashes["boot-entry"] != hashes["boot.sh"]:
+        raise OperationError("Cellular recovery boot entry differs")
+    return {**record, "service_sha256": hashes["service.sh"],
+            "scripts_sha256": {**record["scripts_sha256"], **{n: hashes[n] for n in ("updates.sh", "boot.sh")}}}
+
+
+def recovery_source(oid, names=RECOVERY_SCRIPTS):
+    if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}", oid):
+        raise OperationError("Recovery source must be a full commit OID")
+    def git(*argv):
+        return subprocess.run(["git", "-C", str(HERE), *argv], check=True,
+                              capture_output=True, timeout=20).stdout
+    try:
+        if git("rev-parse", "--verify", oid + "^{commit}").strip() != oid.encode():
+            raise OperationError("Recovery source must be an exact local commit")
+        return {n: git("show", f"{oid}:device/soft-router/{n}") for n in names}
+    except subprocess.CalledProcessError:
+        raise OperationError("Recovery scripts are unavailable at the requested source OID") from None
+
+
+def recovery_sha(files):
+    return {n: hashlib.sha256(b).hexdigest() for n, b in files.items()}
+
+
+def recovery_file_guard(paths, expected, alternative=None):
+    checks = []
+    for name, path in paths.items():
+        options = []
+        for sha in dict.fromkeys([expected.get(name), (alternative or expected).get(name)]):
+            if sha is None:
+                options.append(f"[ ! -e {path} ] && [ ! -L {path} ]")
+            elif isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha):
+                options.append(f'[ -f {path} ] && [ ! -L {path} ] && '
+                               f'[ "$(stat -c %u:%a {path})" = 0:{RECOVERY_MODES[name]} ] && '
+                               f'[ "$(sha256sum {path} | cut -d " " -f 1)" = {sha} ]')
+            else:
+                raise OperationError("Invalid recovery file digest")
+        checks.append("{ " + "; } || { ".join(options) + "; }")
+    return " && ".join("{ " + check + "; }" for check in checks)
+
+
+def recovery_cron():
+    prefix = f"/data/adb/magisk/busybox ash {ROOT}/service.sh"
+    return (f"0 */2 * * * {prefix} update\n").encode(), (
+        f"* * * * * {prefix} recovery-tick >/dev/null 2>&1\n").encode()
+
+
+def recovery_deployment_guard(saved):
+    return recovery_file_guard({"deployment.json": ROOT + "/deployment.json"},
+                               {"deployment.json": saved["base_manifest_sha256"]})
+
+
+def recovery_transaction(device, paths, saved, files, install=False):
+    # Keep the existing crond. Atomically replacing cron/root triggers its directory rescan.
+    old, new = saved["before"], saved["after"]
+    prior, other = (old, None) if install else (old, new)
+    guard = recovery_file_guard(paths, prior, other)
+    verify = recovery_file_guard(paths, new if install else old)
+    if install:
+        order = ["recovery.sh", *[n for n in paths if n not in ("recovery.sh", "recovery.enabled")],
+                 "recovery.enabled"]
+        pending_guard = '[ ! -e updates.pending ] || exit 20\n'
+        preflight = ('/data/adb/magisk/busybox timeout -k 2 5 /data/adb/magisk/busybox sync '
+                     '"$stage/recovery.sh" "$stage"')
+    else:
+        order = ["recovery.enabled", *[n for n in paths if n not in ("recovery.sh", "recovery.enabled")],
+                 "recovery.sh"]
+        pending_guard = '[ ! -e recovery/pending ] && [ ! -L recovery/pending ] || exit 20\n'
+        preflight = ""
+    targets = []
+    for name in order:
+        path = paths[name]
+        if name in files:
+            # If a previous operation left this object at the desired version, keep it.
+            targets.append(f"if ! cmp -s \"$stage/{name}\" {path}; then "
+                           f"chmod {RECOVERY_MODES[name]} \"$stage/{name}\" && mv -f \"$stage/{name}\" {path}; fi")
+        else:
+            targets.append(f"rm -f {path}")
+    script = f"""set -eu
+umask 077
+cd {ROOT}
+[ ! -L {ROOT} ] && [ "$(stat -c %u:%a {ROOT})" = 0:700 ] && [ "$(cat owner)" = f50-soft-router-v1 ]
+exec 9> lifecycle.lock
+/data/adb/magisk/busybox flock -n 9 || exit 28
+[ -f updates.enabled ] && [ -d cron ] && [ ! -L cron ]
+{recovery_deployment_guard(saved)} || exit 20
+{pending_guard}{guard} || exit 20
+snapshot() {{
+    cat /proc/sys/kernel/random/boot_id mihomo.pid tailscaled.pid updates-crond.pid &&
+    sha256sum config.json runtime.json subscription.curl deployment.json
+}}
+before=$(snapshot)
+stage=$(mktemp -d .recovery-stage.XXXXXX)
+trap 'rm -rf "$stage"' EXIT
+/data/adb/magisk/busybox tar -xf - -C "$stage"
+{preflight}
+cron_mtime=$(stat -c %Y cron)
+{chr(10).join(targets)}
+if [ "$(stat -c %Y cron)" = "$cron_mtime" ]; then
+    sleep 1
+    touch -m cron
+fi
+{verify} || exit 20
+[ "$before" = "$(snapshot)" ]
+"""
+    device.require("/data/adb/magisk/busybox ash -c " + shlex.quote(script), data=auth_archive(files))
+
+
+def recovery_install(args, device):
+    state = private_state(args, "Recovery")
+    if any(state.iterdir()):
+        raise OperationError("New recovery state directory must be empty; use check or remove")
+    files = recovery_source(args.source_oid)
+    reject_recovery(device)
+    if check(argparse.Namespace(source_oid=None, state_dir=None), device):
+        raise OperationError("Recovery needs a healthy running deployment")
+    if device.service("updates-check").returncode:
+        raise OperationError("Recovery needs a healthy updates-enabled deployment")
+    base_manifest = device.require(f"cat {ROOT}/deployment.json")
+    baseline = json.loads(base_manifest)
+    paths = recovery_paths(baseline["autostart"])
+    originals = {n: device.require(f"cat {paths[n]}") for n in paths
+                 if n not in ("recovery.sh", "recovery.enabled")}
+    cron, recovery_line = recovery_cron()
+    before = recovery_sha(originals)
+    if (any(before[n] != sha for n, sha in recovery_baseline_scripts(baseline).items()) or
+            originals["cron-root"] != cron or (baseline["autostart"] and
+            originals["boot-entry"] != originals["boot.sh"])):
+        raise OperationError("Unexpected baseline boot entry or cron")
+    files["cron-root"] = cron + recovery_line
+    if baseline["autostart"]:
+        files["boot-entry"] = files["boot.sh"]
+    overlay = {"source_oid": args.source_oid, "base_oid": baseline["source_oid"], "sha256": recovery_sha(files)}
+    files["recovery.enabled"] = json.dumps(overlay, sort_keys=True).encode() + b"\n"
+    saved = {"serial": args.serial, "source_oid": args.source_oid, "autostart": baseline["autostart"],
+             "base_manifest_sha256": hashlib.sha256(base_manifest).hexdigest(),
+             "baseline": {n: base64.b64encode(b).decode() for n, b in originals.items()},
+             "before": before, "after": recovery_sha(files)}
+    private_write(state / "recovery.json", saved)
+    recovery_transaction(device, paths, saved, files, install=True)
+    try:
+        return recovery_check(args, device)
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError):
+        try:
+            recovery_remove(args, device)
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError):
+            raise OperationError("Recovery verification and rollback failed; retain the private backup") from None
+        raise OperationError("Recovery verification failed; original scripts and cron restored") from None
+
+
+def recovery_backup(args):
+    state = private_state(args, "Recovery")
+    path = state / "recovery.json"
+    if not path.is_file() or path.is_symlink() or path.stat().st_mode & 0o077:
+        raise OperationError("Missing or non-private recovery backup")
+    saved = json.loads(path.read_text())
+    if saved["serial"] != args.serial or saved["source_oid"] != args.source_oid:
+        raise OperationError("Recovery backup belongs to a different device or source")
+    paths = recovery_paths(saved["autostart"])
+    originals = {n: base64.b64decode(b, validate=True) for n, b in saved["baseline"].items()}
+    if (originals.keys() != paths.keys() - {"recovery.sh", "recovery.enabled"} or
+            recovery_sha(originals) != saved["before"] or saved["after"].keys() != paths.keys()):
+        raise OperationError("Invalid recovery backup")
+    return saved, paths, originals
+
+
+def recovery_check(args, device):
+    saved, paths, _ = recovery_backup(args)
+    if any(saved["after"][n] != sha for n, sha in recovery_sha(recovery_source(args.source_oid)).items()):
+        raise OperationError("Recovery backup differs from the requested source")
+    device.require(recovery_deployment_guard(saved) + " && " + recovery_file_guard(paths, saved["after"]))
+    if check(argparse.Namespace(source_oid=None, state_dir=None), device):
+        raise OperationError("Installed recovery overlay or underlying services are unhealthy")
+    return 0
+
+
+def recovery_remove(args, device):
+    saved, paths, originals = recovery_backup(args)
+    recovery_transaction(device, paths, saved, originals)
+    return recovery_restore_check(args, device)
+
+
+def recovery_restore_check(args, device):
+    saved, paths, _ = recovery_backup(args)
+    device.require(recovery_deployment_guard(saved) + " && " + recovery_file_guard(paths, saved["before"]))
+    return 0
+
+
 def auth_service(device, action, *, data=None):
     script = (HERE / "auth-service.sh").read_text()
     return device.shell("/data/adb/magisk/busybox ash -c " + shlex.quote(script) +
                         " -- " + action, data=data)
 
 
-def auth_state(args):
+def private_state(args, feature):
     if not args.state_dir or not re.fullmatch(r"[0-9a-f]{40}", args.source_oid or ""):
-        raise OperationError("Auth install/remove/restore-check require --state-dir and a full --source-oid")
+        raise OperationError(f"{feature} requires --state-dir and a full --source-oid")
     state = Path(args.state_dir)
     if not state.is_absolute() or any(p.is_symlink() for p in [state, *state.parents]):
-        raise OperationError("Auth state directory must be absolute without symlinks")
+        raise OperationError(f"{feature} state directory must be absolute without symlinks")
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not state.is_dir() or state.stat().st_uid != os.getuid() or state.stat().st_mode & 0o777 != 0o700:
-        raise OperationError("Auth state directory must be owned by this user with mode 0700")
+        raise OperationError(f"{feature} state directory must be owned by this user with mode 0700")
     return state
+
+
+def auth_state(args):
+    return private_state(args, "Auth")
 
 
 def auth_archive(files):
@@ -648,7 +888,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["apply", "check", "restore", "restore-check", "login", "ts-status",
                                                   "updates-install", "updates-check", "updates-remove",
-                                                  "auth-install", "auth-check", "auth-remove", "auth-restore-check"])
+                                                  "recovery-install", "recovery-check", "recovery-remove",
+                                                  "recovery-restore-check", "auth-install", "auth-check", "auth-remove", "auth-restore-check"])
     parser.add_argument("--serial", required=True)
     parser.add_argument("--source-oid")
     parser.add_argument("--assets-dir")
@@ -671,6 +912,10 @@ def main():
         if args.command.startswith("auth-"):
             return {"auth-install": auth_install, "auth-check": auth_check,
                     "auth-remove": auth_remove, "auth-restore-check": auth_restore_check}[args.command](args, device)
+        elif args.command.startswith("recovery-"):
+            result = {"recovery-install": recovery_install, "recovery-check": recovery_check,
+                      "recovery-remove": recovery_remove,
+                      "recovery-restore-check": recovery_restore_check}[args.command](args, device)
         elif args.command == "apply":
             result = apply(args, device)
         elif args.command.startswith("updates-"):

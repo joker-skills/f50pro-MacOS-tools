@@ -88,6 +88,12 @@ updates-check) updates_check;;
 updates-remove) updates_remove;;
 updates-finalize) updates_finalize;;
 update) update_config;;
+recovery-tick|recovery-rescue)
+    [ -f recovery.enabled ] || exit 0
+    . "$ROOT/recovery.sh"
+    [ "$action" != recovery-rescue ] || [ -e recovery/pending ] || exit 0
+    recovery_tick
+    ;;
 start)
     [ ! -e active ] || exit 22
     for name in mihomo tailscaled; do
