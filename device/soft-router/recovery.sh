@@ -85,16 +85,23 @@ recovery_capture() {
                 printf '%s=%s\n' "$name" "$(cat "/proc/sys/net/netfilter/$name")"
             fi
         done
-    ) 2>/dev/null | head -c 8192 > "$rec_dir/incident.tmp" || return 1
+    ) 2>/dev/null | head -c 7680 > "$rec_dir/incident.tmp" || return 1
     printf '%s\n' "$slot" > "$rec_dir/slot" &&
         mv -f "$rec_dir/incident.tmp" "$rec_incident"
 }
 
 recovery_rescue() {
-    local marker_boot marker_time extra
+    local marker_boot marker_time extra now
     [ -f "$rec_dir/pending" ] && [ ! -L "$rec_dir/pending" ] || return 1
     read -r marker_boot marker_time extra < "$rec_dir/pending" || return 1
     [ -n "$marker_boot" ] && [ -z "$extra" ] && recovery_uint "$marker_time" || return 1
+    now=$(recovery_now) && recovery_uint "$now" || return 1
+    if [ "$marker_boot" != "$rec_boot" ] || [ "$now" -lt "$marker_time" ] ||
+        [ "$((now - marker_time))" -gt 180 ]; then
+        rm -f "$rec_dir/pending" || return 1
+        recovery_log 'pending=expired' || :
+        return 2
+    fi
     [ "$(recovery_setting airplane_mode_on)" = 0 ] || return 1
     case "$(recovery_setting mobile_data)" in
         0|1) recovery_phone enable || return 1;;
@@ -125,12 +132,22 @@ recovery_uint() {
 }
 
 recovery_load() {
-    local saved_boot last extra
+    local saved_boot last extra n
     read -r saved_boot last streak a1 a2 a3 hold extra < "$rec_dir/state" || return 1
-    [ "$saved_boot" = "$rec_boot" ] && [ -z "$extra" ] || return 1
+    [ -n "$saved_boot" ] && [ -z "$extra" ] || return 1
     for n in "$last" "$streak" "$a1" "$a2" "$a3" "$hold"; do recovery_uint "$n" || return 1; done
     [ "$a3" -le "$a2" ] && [ "$a2" -le "$a1" ] && [ "$a1" -le "$last" ] &&
-        [ "$last" -le "$rec_now" ] && [ "$streak" -le 3 ] || return 1
+        [ "$streak" -le 3 ] || return 1
+    if [ "$saved_boot" != "$rec_boot" ]; then
+        if [ "$hold" -gt "$last" ] || { [ "$a1" -ne 0 ] && [ "$((last - a1))" -lt 3600 ]; }; then
+            hold=3600
+        else
+            hold=0
+        fi
+        streak=0 a1=0 a2=0 a3=0
+        return 0
+    fi
+    [ "$last" -le "$rec_now" ] || return 1
     # A gap can mean skipped observations (for example an update held the lock).
     if [ "$((rec_now - last))" -gt 150 ]; then streak=0; fi
 }
@@ -149,7 +166,7 @@ recovery_tick() (
     [ -n "$rec_boot" ] || exit 20
     if [ -e "$rec_dir/pending" ]; then
         if recovery_rescue; then recovery_log 'pending=rescued' || :
-        else recovery_log 'pending=waiting' || :; fi
+        elif [ "$?" = 1 ]; then recovery_log 'pending=waiting' || :; fi
         exit 0
     fi
     [ -f "$ROOT/active" ] || exit 0
@@ -203,6 +220,6 @@ recovery_tick() (
     fi
     recovery_log "attempt=$rec_outcome $rec_probes" || :
     if [ -n "$rec_incident" ]; then
-        printf 'attempt=%s %s\n' "$rec_outcome" "$rec_probes" >> "$rec_incident" || :
+        printf 'attempt=%s %s\n' "$rec_outcome" "$rec_probes" | head -c 512 >> "$rec_incident" || :
     fi
 )

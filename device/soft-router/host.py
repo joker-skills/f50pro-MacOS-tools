@@ -504,9 +504,12 @@ def recovery_paths(autostart):
     return paths
 
 
+def recovery_absent_guard():
+    return recovery_file_guard({n: f"{ROOT}/{n}" for n in ("recovery.enabled", "recovery.sh")}, {})
+
+
 def reject_recovery(device):
-    result = device.shell(f"[ ! -e {ROOT}/recovery.enabled ] && [ ! -L {ROOT}/recovery.enabled ] "
-                          f"&& [ ! -e {ROOT}/recovery.sh ] && [ ! -L {ROOT}/recovery.sh ]")
+    result = device.shell(recovery_absent_guard())
     if result.returncode:
         raise OperationError("Remove the cellular recovery overlay first")
 
@@ -636,7 +639,12 @@ fi
 
 def recovery_install(args, device):
     state = private_state(args, "Recovery")
-    if any(state.iterdir()):
+    journal = state / "recovery.json"
+    existing = None
+    if journal.exists() or journal.is_symlink():
+        existing, _, _ = recovery_backup(args)
+        recovery_restore_check(args, device)
+    elif any(state.iterdir()):
         raise OperationError("New recovery state directory must be empty; use check or remove")
     files = recovery_source(args.source_oid)
     reject_recovery(device)
@@ -664,10 +672,15 @@ def recovery_install(args, device):
              "base_manifest_sha256": hashlib.sha256(base_manifest).hexdigest(),
              "baseline": {n: base64.b64encode(b).decode() for n, b in originals.items()},
              "before": before, "after": recovery_sha(files)}
-    private_write(state / "recovery.json", saved)
+    if existing is None:
+        private_write(journal, saved)
+    elif existing != saved:
+        raise OperationError("Recovery backup differs from this installation")
     recovery_transaction(device, paths, saved, files, install=True)
     try:
-        return recovery_check(args, device)
+        if recovery_check(args, device) != 0:
+            raise OperationError("Recovery was not installed")
+        return 0
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, TypeError, KeyError):
         try:
             recovery_remove(args, device)
@@ -693,12 +706,43 @@ def recovery_backup(args):
 
 
 def recovery_check(args, device):
+    state = private_state(args, "Recovery")
+    journal = state / "recovery.json"
+    if not journal.exists() and not journal.is_symlink():
+        # With no local backup, accept only an absent overlay and the stock update
+        # schedule (or an installation without any update schedule).
+        cron_path = f"{ROOT}/cron/root"
+        cron, _ = recovery_cron()
+        cron_guard = recovery_file_guard({"cron-root": cron_path}, recovery_sha({"cron-root": cron}))
+        device.require(recovery_absent_guard() + f" && {{ {{ [ -d {ROOT}/cron ] && "
+                       f"[ ! -L {ROOT}/cron ] && {cron_guard}; }} || "
+                       f"{{ [ ! -e {ROOT}/cron ] && [ ! -L {ROOT}/cron ] && "
+                       f"[ ! -e {ROOT}/updates.enabled ] && [ ! -L {ROOT}/updates.enabled ]; }}; }}")
+        return 10
+
     saved, paths, _ = recovery_backup(args)
+    baseline_guard = recovery_deployment_guard(saved)
+    before_guard = recovery_file_guard(paths, saved["before"])
+    if device.require(f"if {baseline_guard} && {before_guard}; then printf restored; fi") == b"restored":
+        return 10
     if any(saved["after"][n] != sha for n, sha in recovery_sha(recovery_source(args.source_oid)).items()):
         raise OperationError("Recovery backup differs from the requested source")
-    device.require(recovery_deployment_guard(saved) + " && " + recovery_file_guard(paths, saved["after"]))
-    if check(argparse.Namespace(source_oid=None, state_dir=None), device):
-        raise OperationError("Installed recovery overlay or underlying services are unhealthy")
+    device.require(baseline_guard + " && " + recovery_file_guard(paths, saved["after"]))
+    record = json.loads(device.require(f"{baseline_guard} && cat {ROOT}/deployment.json"))
+    # The backup pins this deployed manifest. It supplies the binary and network
+    # digests, and the overlay hashes above pin the actual service entry point.
+    expected = {name: record["sha256"][name] for name in ("mihomo", "tailscale", "tailscaled")}
+    expected["network.sh"] = record["scripts_sha256"]["network.sh"]
+    for name, sha in expected.items():
+        actual = device.require(f"sha256sum {ROOT}/{name}").decode().split()
+        if not actual or actual[0] != sha:
+            raise OperationError("Deployed binary or network script differs from the baseline")
+    mode = "transparent" if record["transparent"] else "explicit"
+    boot_guard = f"[ -f {ROOT}/boot-enabled ] && " if record["autostart"] else ""
+    device.require(f'[ "$(cat {ROOT}/mode)" = {mode} ] && {boot_guard}'
+                   f'[ -f {ROOT}/updates.enabled ] && '
+                   f"/data/adb/magisk/busybox ash {ROOT}/service.sh check")
+    tailscale_status(device)
     return 0
 
 
