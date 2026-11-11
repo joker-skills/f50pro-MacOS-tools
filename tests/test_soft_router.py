@@ -723,8 +723,10 @@ fi
         with patch.object(host.Device, "shell") as shell:
             host.Device("fake").service("check")
             self.assertTrue(shell.call_args.args[0].startswith("/data/adb/magisk/busybox ash -c "))
-        self.assertEqual((MODULE.parent / "boot.sh").read_text().count(
-            '/data/adb/magisk/busybox ash "$ROOT/service.sh"'), 3)
+        boot = (MODULE.parent / "boot.sh").read_text()
+        self.assertIn('service() { /data/adb/magisk/busybox ash "$ROOT/service.sh" "$@"; }', boot)
+        for action in ("uplink", "boot", "stop", "recovery-rescue"):
+            self.assertIn(f"service {action}", boot)
 
 
 class UpdateServiceTest(unittest.TestCase):

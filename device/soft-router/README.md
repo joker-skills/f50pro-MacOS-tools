@@ -121,7 +121,7 @@ symlink，不接受任意上传路径；忽略其它文件。允许名单与 And
   核验中断时保留备份和 pending，可重复同一 remove 完成恢复。
   本机 state-dir 只有成功恢复且重新核实原态后才允许同候选再次试验；未知恢复材料不会被覆盖。
 
-设备定时任务独占自己的 `cron/root`，不覆盖系统 crontab，正式唯一行如下：
+设备定时任务独占自己的 `cron/root`，不覆盖系统 crontab。订阅更新行如下：
 
 ```cron
 0 */2 * * * /data/adb/magisk/busybox ash /data/adb/f50-soft-router/service.sh update
@@ -149,6 +149,30 @@ pending、回读或调度故障仍由 updates-check 返回非零报告。
 手动停服务后，cron 不会拉起代理；没有增加看门狗。运行中换接口仍需既有停止/启动入口。
 完整国内/国外出口、反套娃、真实 DNS/UDP/IPv6、原 PID HUP 和长连接保持必须由独立实机探针确认，
 本地单测不代表这些验收已经完成。
+
+### 蜂窝数据面恢复（可选）
+
+已有健康且启用自主更新的设备可用 `host.py recovery-install` 启用恢复检测。
+`recovery-install`、`recovery-check`、`recovery-remove`、`recovery-restore-check`
+都传同一 `--serial`、完整合入提交的 `--source-oid` 和独立的绝对 `--state-dir`。
+保留该私有目录以便回滚。核实恢复原状后，可用同一备份重装同一版本。需要移除订阅更新时，
+先运行 `recovery-remove`。检查返回 0 表示已安装并通过核验，10 表示已确认未安装，20 表示状态异常。
+安装复用现有 crond，不重启或重载代理与 Tailscale，不改代理配置或订阅。
+
+每分钟检测一次。Baidu、QQ、JD 均用绑定蜂窝接口的直连 HTTPS HEAD；完成 HTTP 响应
+即表示传输正常，HTTP 错误状态也算。连续三轮全部失败才采集诊断并关闭、重新打开
+移动数据。两次尝试至少隔 10 分钟，每小时最多三次。开机宽限为 5 分钟。若上一次
+保存的状态显示过去一小时内有重拨，或仍有限额等待，则重启后等到开机满一小时。状态损坏时，从发现起
+暂停重拨一小时。手动关闭数据、飞行模式、开关状态不明或没有唯一有效蜂窝接口时跳过。
+
+重拨中断后，只在同一次开机且标记创建后 180 秒内尝试重新开启数据。设备在这个窗口内
+无法区分功能自身的关闭与用户随后手动关闭。超过期限或重启时清除标记并记录诊断，
+移动数据保持当时的状态。
+
+诊断位于设备的 `/data/adb/f50-soft-router/recovery/`，仅 root 可读，保留最近 10 份
+现场及两段轮转事件日志。可用已有 ADB root 通道读取 `events.log`、`events.previous`
+及 `incident.*`。日志只含探针传输结果和设备汇总状态，无响应正文、抓包或原始代理日志。
+移除功能会恢复脚本和 cron，保留诊断及重拨限额记录。
 
 单测依赖中心 `proxy-config` 的 `bbf3c070` 版 `render/f50.py`，按文件 SHA256 校验，
 不会复制适配器实现。默认查找正式 checkout；其它位置用 `F50_PROXY_CONFIG_ROOT` 指定。
