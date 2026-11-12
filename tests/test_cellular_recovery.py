@@ -1,8 +1,11 @@
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -23,73 +26,231 @@ class RecoveryTest(unittest.TestCase):
         helper = MODULE.with_name("recovery.sh")
         result = subprocess.run(["sh", "-eu", "-c", '. "$2"\n' + script, "--",
                                  str(self.root), str(helper)], env={**os.environ, "ROOT": str(self.root)},
-                                text=True, capture_output=True)
+                                text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result.stdout
 
+    clock = """
+at() { printf '%s\n' "$1" > "$ROOT/clock"; }
+recovery_now() { cat "$ROOT/clock"; }
+sleep() { at "$(($(recovery_now) + $1))"; }
+at 1000
+"""
+
     def decisions(self, script):
-        return self.run_shell("""
-boot=fixture-one now=1000 mode=1
+        return self.run_shell(self.clock + """
+boot=fixture-one
 recovery_boot() { echo "$boot"; }
-recovery_now() { echo "$now"; }
-recovery_allowed() { [ "$mode" != off ]; }
-recovery_probe() { [ "$mode" = healthy ]; }
-recovery_capture() { echo "capture $now" >> "$ROOT/actions"; }
-recovery_redial() { echo "redial $now" >> "$ROOT/actions"; return 1; }
-tick() { recovery_tick; now=$((now+60)); }
-three() { tick; tick; tick; }
+recovery_allowed() { return 0; }
+recovery_probe() { return 1; }
+recovery_capture() { echo "capture $(recovery_now)" >> "$ROOT/actions"; }
+recovery_redial() { echo "redial $(recovery_now)" >> "$ROOT/actions"; }
 count() { grep -c '^redial' "$ROOT/actions" || :; }
 touch "$ROOT/actions"
 """ + script)
 
-    def test_three_rounds_capture_before_attempt_and_both_resets(self):
+    def test_boot_grace_confirmation_and_first_success(self):
         self.decisions("""
-now=120
-three
+recovery_probe() {
+    echo "probe $(recovery_now)" >> "$ROOT/actions"
+    [ "$(count)" = 1 ]
+}
+at 59; recovery_tick
 [ "$(count)" = 0 ]
-now=1000
-tick; tick
-mode=off; tick; mode=1
-tick; tick
-mode=healthy; tick; mode=1
-tick; tick
-[ "$(count)" = 0 ]
-tick
+at 60; recovery_tick
 [ "$(count)" = 1 ]
 """)
         self.assertEqual((self.root / "actions").read_text().splitlines(),
-                         ["capture 1480", "redial 1480"])
+                         ["probe 60", "probe 75", "capture 75", "redial 75", "probe 75"])
 
-    def test_failed_attempts_spend_budget_and_boot_and_bad_state_hold_it(self):
+    def test_first_failure_retries_once_and_two_failures_cool_down(self):
         self.decisions("""
-three
-now=1600; tick; tick; now=1719; tick
-[ "$(count)" = 1 ]
-now=1720; tick
-now=2200; tick; tick; tick
+recovery_tick
+[ "$(count)" = 2 ]
+at 1135; recovery_tick
+at 1673; recovery_tick
+[ "$(count)" = 2 ]
+at 1674; recovery_tick
 [ "$(count)" = 3 ]
-now=4300; three
+at 2300; recovery_tick
+at 4614; recovery_tick
 [ "$(count)" = 3 ]
-now=4600; tick; tick; now=4720; tick
-[ "$(count)" = 4 ]
-boot=fixture-two now=30; tick
-now=700; three
+""")
+        self.assertEqual((self.root / "actions").read_text().splitlines(),
+                         ["capture 1015", "redial 1015", "redial 1074",
+                          "capture 1689", "redial 1689"])
+        self.assertEqual((self.root / "recovery/events.log").read_text().count("attempt=post-failed"), 3)
+
+    def test_reboot_and_bad_state_hold_budget(self):
+        self.decisions("""
+recovery_tick
+boot=fixture-two
+at 60; recovery_tick
+at 3599; recovery_tick
+[ "$(count)" = 2 ]
+at 3600; recovery_tick
 [ "$(count)" = 4 ]
 echo broken > "$ROOT/recovery/state"
-now=5000; three
+at 5000; recovery_tick
+at 8599; recovery_tick
 [ "$(count)" = 4 ]
-now=8600; three
-[ "$(count)" = 5 ]
+at 8600; recovery_tick
+[ "$(count)" = 6 ]
 """)
         self.assertIn("budget=held", (self.root / "recovery/events.log").read_text())
 
     def test_boot_without_recent_attempt_uses_only_normal_grace(self):
         self.decisions("""
-mode=healthy; tick
-boot=fixture-two now=300 mode=1
-three
+recovery_probe() { [ "$boot" = fixture-one ]; }
+recovery_tick
+boot=fixture-two
+at 60; recovery_tick
+[ "$(count)" = 2 ]
+""")
+
+    def test_reconfirmation_and_post_probe_can_stop_recovery(self):
+        self.decisions("""
+recovery_probe() {
+    case "$(recovery_now)" in
+        1000|2000|3000|3015) return 1;;
+        1015) return 0;;
+        *) return 2;;
+    esac
+}
+recovery_tick
+at 2000; recovery_tick
+[ "$(count)" = 0 ]
+recovery_probe() {
+    [ "$(count)" = 0 ] && return 1
+    return 2
+}
+at 3000; recovery_tick
 [ "$(count)" = 1 ]
 """)
+        log = (self.root / "recovery/events.log").read_text()
+        for event in ("healthy", "probe-unavailable", "attempt=post-unavailable"):
+            self.assertIn(f" {event} ", log)
+
+    def test_post_deadline_includes_checks_curl_and_sleep(self):
+        self.run_shell(self.clock + """
+BB=busybox_fixture
+busybox_fixture() {
+    [ "$1:$2:$3" = timeout:-k:1 ] || exit 90
+    limit=$4
+    shift 4
+    case "$*" in
+        '/system/bin/settings get global mobile_data') elapsed=3; value=1;;
+        '/system/bin/settings get global airplane_mode_on') elapsed=2; value=0;;
+        *'service.sh uplink') elapsed=2; value=sipa_eth0;;
+        *) exit 91;;
+    esac
+    [ "$((limit + 1 + $(recovery_now)))" -lt 1060 ] || exit 92
+    [ "$elapsed" -le "$limit" ] || return 1
+    sleep "$elapsed"
+    echo "$value"
+}
+curl() {
+    while [ "$1" != --max-time ]; do shift; done
+    limit=$2
+    [ "$((limit + $(recovery_now)))" -lt 1060 ] || exit 93
+    echo "$limit" >> "$ROOT/timeouts"
+    sleep "$limit"
+    return 28
+}
+recovery_post
+[ "$rec_outcome" = post-failed ]
+[ "$(recovery_now)" -le 1060 ]
+""")
+        self.assertEqual((self.root / "timeouts").read_text().splitlines(),
+                         ["8", "8", "8", "8", "8", "2"])
+
+    def test_no_uplink_after_redial_is_rechecked_until_available(self):
+        self.decisions("""
+recovery_allowed() {
+    rec_reason=no-cellular-uplink
+    [ "$(count)" = 0 ] || [ "$(recovery_now)" -ge 1021 ]
+}
+recovery_probe() { [ "$(count)" = 1 ]; }
+recovery_tick
+[ "$(recovery_now)" = 1021 ]
+[ "$(count)" = 1 ]
+""")
+        self.assertIn("attempt=post-healthy", (self.root / "recovery/events.log").read_text())
+
+    def test_real_redial_checks_safety_after_persisting_each_attempt(self):
+        for reason in ("manual-off", "airplane", "unknown", "no-uplink", "flush"):
+            with self.subTest(reason=reason):
+                (self.root / "scenario").write_text(reason)
+                self.run_shell(self.clock + """
+recovery_boot() { echo fixture; }
+recovery_capture() { :; }
+recovery_probe() { return 1; }
+recovery_setting() {
+    case "$1" in
+        mobile_data) cat "$ROOT/data";;
+        airplane_mode_on) cat "$ROOT/air";;
+    esac
+}
+uplink() { [ ! -e "$ROOT/no-uplink" ] && echo sipa_eth0; }
+recovery_timeout() { uplink; }
+recovery_flush() {
+    read -r boot last streak a1 a2 a3 hold < "$rec_dir/state"
+    [ "$last" = "$rec_now" ] && [ "$a1" = "$rec_now" ] && [ -f "$rec_dir/pending" ] || exit 90
+    if [ "$a2" = 0 ]; then return 0; fi
+    case "$(cat "$ROOT/scenario")" in
+        manual-off) echo 0 > "$ROOT/data";;
+        airplane) echo 1 > "$ROOT/air";;
+        unknown) echo null > "$ROOT/data";;
+        no-uplink) touch "$ROOT/no-uplink";;
+        flush) return 1;;
+    esac
+}
+recovery_phone() {
+    echo "$1" >> "$ROOT/toggles"
+    case "$1" in
+        disable) echo 0 > "$ROOT/data";;
+        enable) echo 1 > "$ROOT/data";;
+    esac
+}
+rm -rf "$ROOT/recovery"
+rm -f "$ROOT/no-uplink" "$ROOT/toggles"
+echo 1 > "$ROOT/data"
+echo 0 > "$ROOT/air"
+recovery_tick
+[ ! -e "$ROOT/recovery/pending" ]
+""")
+                self.assertEqual((self.root / "toggles").read_text().splitlines(), ["disable", "enable"])
+
+    def test_reconfirmation_checks_uplink_and_state_write_failure_blocks_redial(self):
+        self.decisions("""
+recovery_allowed() {
+    rec_reason=no-cellular-uplink
+    [ "$(recovery_now)" != 1015 ]
+}
+recovery_tick
+[ "$(count)" = 0 ]
+recovery_capture() { mkdir "$rec_dir/state.tmp"; }
+at 2000
+rc=0; recovery_tick || rc=$?
+[ "$rc" = 20 ] && [ "$(count)" = 0 ]
+""")
+        self.assertIn("skipped=no-cellular-uplink", (self.root / "recovery/events.log").read_text())
+
+    def test_lifecycle_lock_skips_overlapping_tick(self):
+        (self.root / "owner").write_text("f50-soft-router-v1\n")
+        (self.root / "recovery.sh").write_text('recovery_tick() { touch "$ROOT/entered"; }\n')
+        fixture_lock = shlex.join([sys.executable, "-c",
+                                   "import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)"])
+        service = MODULE.with_name("service.sh").read_text().replace(
+            "ROOT=/data/adb/f50-soft-router", "ROOT=" + shlex.quote(str(self.root))
+        ).replace("/data/adb/magisk/busybox flock -n 9", fixture_lock + " 2>/dev/null")
+        command = ["sh", "-c", service, "--", "recovery-tick"]
+        with (self.root / "lifecycle.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(subprocess.run(command, timeout=5).returncode, 28)
+            self.assertFalse((self.root / "entered").exists())
+        self.assertEqual(subprocess.run(command, timeout=5).returncode, 0)
+        self.assertTrue((self.root / "entered").exists())
 
     def test_probe_uses_bound_head_counts_http_error_and_rejects_local_failure(self):
         self.run_shell("""
@@ -126,6 +287,7 @@ printf '0\n' > "$ROOT/air"
 recovery_setting() {
     case "$1" in mobile_data) cat "$ROOT/data";; airplane_mode_on) cat "$ROOT/air";; esac
 }
+uplink() { echo sipa_eth0; }
 recovery_boot() { echo "$rec_boot"; }
 recovery_now() { echo "$rec_now"; }
 recovery_phone() {
@@ -177,14 +339,11 @@ done
 """)
 
     def test_incident_cap_includes_post_redial_result(self):
-        self.run_shell("""
-now=1000
+        self.run_shell(self.clock + """
 recovery_boot() { echo fixture; }
-recovery_now() { echo "$now"; }
 recovery_allowed() { rec_if=sipa_eth0 rec_data=1 rec_air=0; }
 recovery_probe() { rec_probes=$(printf '%600s' probe); return 1; }
 recovery_redial() { return 0; }
-sleep() { :; }
 df() { printf 'Filesystem blocks used available capacity mount\n/tmp 8000 1 7999 1%% /tmp\n'; }
 cat() {
     if [ "$1" = /proc/net/sockstat ]; then
@@ -192,12 +351,10 @@ cat() {
     else command cat "$@"; fi
 }
 recovery_tick
-now=1060; recovery_tick
-now=1120; recovery_tick
 """)
         incident = (self.root / "recovery/incident.0").read_bytes()
-        self.assertEqual(len(incident), 8192)
-        self.assertIn(b"attempt=post-failed", incident[7680:])
+        self.assertLessEqual(len(incident), 8192)
+        self.assertEqual(incident[7680:].count(b"attempt=post-failed"), 2)
 
     def test_diagnostics_are_bounded_private_and_low_space_does_not_gate_recovery(self):
         self.run_shell("""
@@ -218,9 +375,8 @@ recovery_now() { echo "$rec_now"; }
 recovery_allowed() { return 0; }
 recovery_probe() { return 1; }
 recovery_redial() { touch "$ROOT/attempted"; return 1; }
+sleep() { :; }
 recovery_tick
-rec_now=1260; recovery_tick
-rec_now=1320; recovery_tick
 [ -e "$ROOT/attempted" ]
 """)
         directory = self.root / "recovery"

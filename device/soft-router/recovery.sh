@@ -1,7 +1,24 @@
 # Internal functions; service.sh holds lifecycle.lock. Sourcing has no side effects.
 recovery_now() { awk -F. 'NR == 1 {print $1}' /proc/uptime; }
 recovery_boot() { cat /proc/sys/kernel/random/boot_id; }
-recovery_timeout() { "${BB:-/data/adb/magisk/busybox}" timeout -k 2 5 "$@"; }
+recovery_remaining() {
+    local now
+    now=$(recovery_now) && recovery_uint "$now" || return 1
+    # Uptime is rounded down; leave one second for the fractional part.
+    [ "$((rec_deadline - now))" -gt 1 ] || return 1
+    printf '%s\n' "$((rec_deadline - now - 1))"
+}
+
+recovery_timeout() {
+    local limit=5 kill=2
+    if [ -n "${rec_deadline:-}" ]; then
+        limit=$(recovery_remaining) && [ "$limit" -gt 1 ] || return 1
+        kill=1
+        limit=$((limit - kill))
+        [ "$limit" -le 5 ] || limit=5
+    fi
+    "${BB:-/data/adb/magisk/busybox}" timeout -k "$kill" "$limit" "$@"
+}
 recovery_setting() { recovery_timeout /system/bin/settings get global "$1" 2>/dev/null; }
 recovery_phone() { recovery_timeout /system/bin/cmd phone data "$1" >/dev/null 2>&1; }
 recovery_flush() {
@@ -21,7 +38,12 @@ recovery_allowed() {
         *) return 1;;
     esac
     rec_reason=no-cellular-uplink
-    rec_if=$(uplink 2>/dev/null) || return 1
+    if [ -n "${rec_deadline:-}" ]; then
+        # The service's read-only uplink action runs before the lifecycle lock.
+        rec_if=$(recovery_timeout "${BB:-/data/adb/magisk/busybox}" ash "$ROOT/service.sh" uplink 2>/dev/null) || return 1
+    else
+        rec_if=$(uplink 2>/dev/null) || return 1
+    fi
     rec_reason=no-curl
     command -v curl >/dev/null
 }
@@ -29,12 +51,21 @@ recovery_allowed() {
 # HEAD gets the TLS and HTTP result without transferring or retaining a body.
 # -q suppresses curlrc; if! forbids fallback to resolving the interface name.
 recovery_probe() {
+    local limit
     rec_probes=
     rec_invalid=0
     for rec_host in www.baidu.com www.qq.com www.jd.com; do
+        limit=8
+        if [ -n "${rec_deadline:-}" ]; then
+            if ! limit=$(recovery_remaining); then
+                [ "$rec_invalid" = 0 ] || return 2
+                return 3
+            fi
+            [ "$limit" -le 8 ] || limit=8
+        fi
         rec_rc=0
         rec_metrics=$(curl -q -4 --silent --noproxy '*' --interface "if!$rec_if" \
-            --proto '=https' --head --output /dev/null --max-time 8 --connect-timeout 5 \
+            --proto '=https' --head --output /dev/null --max-time "$limit" --connect-timeout 5 \
             --write-out '%{remote_ip} %{http_code} %{time_connect} %{time_appconnect} %{time_total}' \
             "https://$rec_host/" 2>/dev/null) || rec_rc=$?
         # Curl write-out contains only numeric transport fields, with an optional IPv4 address.
@@ -111,20 +142,43 @@ recovery_rescue() {
 }
 
 recovery_redial() (
-    # Recheck after diagnostics; don't take ownership of an already disabled radio.
-    [ "$(recovery_setting mobile_data)" = 1 ] &&
-        [ "$(recovery_setting airplane_mode_on)" = 0 ] || exit 1
     [ ! -e "$rec_dir/pending" ] &&
         printf '%s %s\n' "$rec_boot" "$rec_now" > "$rec_dir/pending.tmp" &&
-        mv -f "$rec_dir/pending.tmp" "$rec_dir/pending" || exit 1
-    # Make the budget and rescue marker durable before touching the radio.
-    recovery_flush || { rm -f "$rec_dir/pending"; exit 1; }
-    trap 'if [ -e "$rec_dir/pending" ]; then recovery_rescue || :; fi' EXIT
+        mv -f "$rec_dir/pending.tmp" "$rec_dir/pending" || exit 2
+    trap 'rm -f "$rec_dir/pending"' EXIT
     trap 'exit 1' HUP INT TERM
+    # Make the budget and rescue marker durable before touching the radio.
+    recovery_flush && recovery_allowed || exit 2
+    trap 'if [ -e "$rec_dir/pending" ]; then recovery_rescue || :; fi' EXIT
     recovery_phone disable || exit 1
     sleep 4
     recovery_rescue
 )
+
+recovery_post() {
+    local rec_deadline rec_wait result saw_failure=0
+    rec_outcome=post-unavailable
+    rec_deadline=$(recovery_now) && recovery_uint "$rec_deadline" || return 0
+    rec_deadline=$((rec_deadline + 60))
+    while rec_wait=$(recovery_remaining) && [ "$rec_wait" -gt 1 ]; do
+        if recovery_allowed; then
+            result=0
+            recovery_probe || result=$?
+            case "$result" in
+                0) rec_outcome=post-healthy; return 0;;
+                1) saw_failure=1;;
+                3) break;;
+                *) return 0;;
+            esac
+        elif [ "$rec_reason" != no-cellular-uplink ]; then
+            return 0
+        fi
+        rec_wait=$(recovery_remaining) || break
+        [ "$rec_wait" -le 3 ] || rec_wait=3
+        sleep "$rec_wait"
+    done
+    if [ "$saw_failure" = 1 ]; then rec_outcome=post-failed; fi
+}
 
 recovery_uint() {
     case "$1" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
@@ -132,7 +186,7 @@ recovery_uint() {
 }
 
 recovery_load() {
-    local saved_boot last extra n
+    local saved_boot last streak extra n
     read -r saved_boot last streak a1 a2 a3 hold extra < "$rec_dir/state" || return 1
     [ -n "$saved_boot" ] && [ -z "$extra" ] || return 1
     for n in "$last" "$streak" "$a1" "$a2" "$a3" "$hold"; do recovery_uint "$n" || return 1; done
@@ -144,16 +198,15 @@ recovery_load() {
         else
             hold=0
         fi
-        streak=0 a1=0 a2=0 a3=0
+        a1=0 a2=0 a3=0
         return 0
     fi
-    [ "$last" -le "$rec_now" ] || return 1
-    # A gap can mean skipped observations (for example an update held the lock).
-    if [ "$((rec_now - last))" -gt 150 ]; then streak=0; fi
+    [ "$last" -le "$rec_now" ]
 }
 
 recovery_save() {
-    printf '%s %s %s %s %s %s %s\n' "$rec_boot" "$rec_now" "$streak" "$a1" "$a2" "$a3" "$hold" \
+    # Keep the legacy streak field readable by the previous overlay.
+    printf '%s %s 0 %s %s %s %s\n' "$rec_boot" "$rec_now" "$a1" "$a2" "$a3" "$hold" \
         > "$rec_dir/state.tmp" && mv -f "$rec_dir/state.tmp" "$rec_dir/state"
 }
 
@@ -170,56 +223,56 @@ recovery_tick() (
         exit 0
     fi
     [ -f "$ROOT/active" ] || exit 0
-    streak=0 a1=0 a2=0 a3=0 hold=0
+    a1=0 a2=0 a3=0 hold=0
     if [ -e "$rec_dir/state" ] && ! recovery_load; then
-        streak=0 a1=0 a2=0 a3=0 hold=$((rec_now + 3600))
+        a1=0 a2=0 a3=0 hold=$((rec_now + 3600))
         recovery_log 'state=reset budget=held' || :
     fi
     rec_reason=boot-grace
-    if [ "$rec_now" -lt 300 ] || ! recovery_allowed; then
-        streak=0
-        recovery_save || exit 20
-        recovery_log "skipped=$rec_reason mobile_data=${rec_data:-unknown} airplane_mode=${rec_air:-unknown}" || :
-        exit 0
-    fi
-    rec_probes= rec_invalid=0
-    result=0
-    recovery_probe || result=$?
-    if [ "$result" = 0 ] || [ "$rec_invalid" != 0 ]; then
-        streak=0
-        recovery_save || exit 20
-        if [ "$result" = 0 ]; then recovery_log "healthy $rec_probes" || :
-        else recovery_log "probe-unavailable $rec_probes" || :; fi
-        exit 0
-    fi
-    [ "$streak" -ge 3 ] || streak=$((streak + 1))
-    recovery_log "failed=$streak $rec_probes" || :
-    if [ "$streak" -lt 3 ] || [ "$rec_now" -lt "$hold" ] ||
-        { [ "$a1" -ne 0 ] && [ "$((rec_now - a1))" -lt 600 ]; } ||
-        { [ "$a3" -ne 0 ] && [ "$((rec_now - a3))" -lt 3600 ]; }; then
-        recovery_save
-        exit $?
-    fi
+    rec_probes=
+    recovery_save || exit 20
+    for round in 1 2; do
+        if [ "$rec_now" -lt 60 ] || ! recovery_allowed; then
+            recovery_log "skipped=$rec_reason mobile_data=${rec_data:-unknown} airplane_mode=${rec_air:-unknown}" || :
+            exit 0
+        fi
+        result=0
+        recovery_probe || result=$?
+        case "$result" in
+            0) recovery_log "healthy $rec_probes" || :; exit 0;;
+            1) recovery_log "failed=$round $rec_probes" || :;;
+            *) recovery_log "probe-unavailable $rec_probes" || :; exit 0;;
+        esac
+        if [ "$round" = 1 ]; then
+            if [ "$rec_now" -lt "$hold" ] ||
+                { [ "$a1" -ne 0 ] && [ "$((rec_now - a1))" -lt 600 ]; } ||
+                { [ "$a3" -ne 0 ] && [ "$((rec_now - a3))" -lt 3600 ]; }; then
+                exit 0
+            fi
+            sleep 15
+        fi
+    done
 
     rec_incident=
     recovery_capture || { rec_incident=; recovery_log 'capture=unavailable' || :; }
-    attempt_now=$(recovery_now) && recovery_uint "$attempt_now" &&
-        [ "$attempt_now" -ge "$rec_now" ] || exit 20
-    rec_now=$attempt_now
-    a3=$a2 a2=$a1 a1=$rec_now streak=0
-    recovery_save || exit 20 # Spend the budget even if the attempt fails or is interrupted.
-    rec_probes=
-    rec_outcome=redial-failed
-    if recovery_redial; then
-        sleep 3
-        rec_outcome=post-unavailable
-        if recovery_allowed; then
-            if recovery_probe; then rec_outcome=post-healthy
-            elif [ "$rec_invalid" = 0 ]; then rec_outcome=post-failed; fi
+    # Only the second attempt in this tick bypasses the cooldown.
+    for attempt in 1 2; do
+        attempt_now=$(recovery_now) && recovery_uint "$attempt_now" &&
+            [ "$attempt_now" -ge "$rec_now" ] || exit 20
+        rec_now=$attempt_now
+        [ "$a3" -eq 0 ] || [ "$((rec_now - a3))" -ge 3600 ] || exit 0
+        [ ! -e "$rec_dir/pending" ] && recovery_allowed || exit 0
+        a3=$a2 a2=$a1 a1=$rec_now
+        recovery_save || exit 20 # Spend the budget even if the attempt fails or is interrupted.
+        rec_probes=
+        rec_outcome=redial-failed
+        result=0
+        recovery_redial || result=$?
+        if [ "$result" = 0 ]; then recovery_post; fi
+        recovery_log "attempt=$rec_outcome $rec_probes" || :
+        if [ -n "$rec_incident" ]; then
+            printf 'attempt=%s %.230s\n' "$rec_outcome" "$rec_probes" >> "$rec_incident" || :
         fi
-    fi
-    recovery_log "attempt=$rec_outcome $rec_probes" || :
-    if [ -n "$rec_incident" ]; then
-        printf 'attempt=%s %s\n' "$rec_outcome" "$rec_probes" | head -c 512 >> "$rec_incident" || :
-    fi
+        case "$rec_outcome:$result" in post-failed:0|redial-failed:1) ;; *) break;; esac
+    done
 )
