@@ -177,6 +177,67 @@ recovery_tick
 """)
         self.assertIn("attempt=post-healthy", (self.root / "recovery/events.log").read_text())
 
+    def test_post_deadline_preserves_failure_for_retry_with_fresh_settings(self):
+        for scenario, outcomes in (
+            ("retry", ["post-failed", "post-healthy"]),
+            ("fresh-manual-off", ["post-failed"]),
+            ("manual-off", ["post-unavailable"]),
+            ("settings-error", ["post-unavailable"]),
+        ):
+            with self.subTest(scenario=scenario):
+                (self.root / "scenario").write_text(scenario)
+                self.run_shell(self.clock + """
+scenario=$(cat "$ROOT/scenario")
+ROOT=$ROOT/$scenario
+mkdir "$ROOT"
+touch "$ROOT/active" "$ROOT/recovery.enabled" "$ROOT/attempts"
+at 1000
+BB=busybox_fixture
+busybox_fixture() {
+    shift 4
+    case "$*" in
+        '/system/bin/settings get global mobile_data')
+            case "$(recovery_now):${rec_deadline:-}" in
+                1042:1075) sleep 3;;
+                1072:1075)
+                    sleep 1
+                    case "$scenario" in
+                        manual-off) echo 0; return 0;;
+                        settings-error) return 3;;
+                    esac
+                    ;;
+                1073:) if [ "$scenario" = fresh-manual-off ]; then echo 0; return 0; fi;;
+            esac
+            echo 1;;
+        '/system/bin/settings get global airplane_mode_on')
+            if [ "$(recovery_now):${rec_deadline:-}" = 1073:1075 ]; then
+                touch "$ROOT/late-settings"
+            fi
+            echo 0;;
+        *'service.sh uplink') uplink;;
+        *) exit 90;;
+    esac
+}
+uplink() { echo sipa_eth0; }
+recovery_boot() { echo fixture; }
+recovery_capture() { :; }
+recovery_redial() { recovery_now >> "$ROOT/attempts"; }
+recovery_probe() {
+    case "$(wc -l < "$ROOT/attempts" | tr -d ' ')" in
+        0) return 1;;
+        1) sleep 24; return 1;;
+        2) return 0;;
+    esac
+}
+recovery_tick
+[ ! -e "$ROOT/late-settings" ]
+""")
+                directory = self.root / scenario
+                log = (directory / "recovery/events.log").read_text()
+                self.assertEqual(re.findall(r" attempt=(\S+)", log), outcomes)
+                expected_attempts = ["1015", "1073"] if scenario == "retry" else ["1015"]
+                self.assertEqual((directory / "attempts").read_text().splitlines(), expected_attempts)
+
     def test_real_redial_checks_safety_after_persisting_each_attempt(self):
         for reason in ("manual-off", "airplane", "unknown", "no-uplink", "flush"):
             with self.subTest(reason=reason):

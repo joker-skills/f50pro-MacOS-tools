@@ -5,19 +5,21 @@ recovery_remaining() {
     local now
     now=$(recovery_now) && recovery_uint "$now" || return 1
     # Uptime is rounded down; leave one second for the fractional part.
-    [ "$((rec_deadline - now))" -gt 1 ] || return 1
+    [ "$((rec_deadline - now))" -gt 1 ] || return 3
     printf '%s\n' "$((rec_deadline - now - 1))"
 }
 
 recovery_timeout() {
     local limit=5 kill=2
     if [ -n "${rec_deadline:-}" ]; then
-        limit=$(recovery_remaining) && [ "$limit" -gt 1 ] || return 1
+        limit=$(recovery_remaining) || return "$?"
+        [ "$limit" -gt 1 ] || return 3
         kill=1
         limit=$((limit - kill))
         [ "$limit" -le 5 ] || limit=5
     fi
-    "${BB:-/data/adb/magisk/busybox}" timeout -k "$kill" "$limit" "$@"
+    # Status 3 means the deadline prevented starting the command.
+    "${BB:-/data/adb/magisk/busybox}" timeout -k "$kill" "$limit" "$@" || return 1
 }
 recovery_setting() { recovery_timeout /system/bin/settings get global "$1" 2>/dev/null; }
 recovery_phone() { recovery_timeout /system/bin/cmd phone data "$1" >/dev/null 2>&1; }
@@ -27,8 +29,15 @@ recovery_flush() {
 
 recovery_allowed() {
     rec_reason=settings-unknown
-    rec_data=$(recovery_setting mobile_data) || rec_data=unknown
-    rec_air=$(recovery_setting airplane_mode_on) || rec_air=unknown
+    rec_data=$(recovery_setting mobile_data) || {
+        [ "$?" != 3 ] || return 3
+        rec_data=unknown
+    }
+    rec_air=$(recovery_setting airplane_mode_on) || {
+        # An observed manual-off or unknown value still blocks retry.
+        if [ "$?" = 3 ] && [ "$rec_data" = 1 ]; then return 3; fi
+        rec_air=unknown
+    }
     case "$rec_data" in 0|1) ;; *) rec_data=unknown;; esac
     case "$rec_air" in 0|1) ;; *) rec_air=unknown;; esac
     case "$rec_data:$rec_air" in
@@ -170,6 +179,8 @@ recovery_post() {
                 3) break;;
                 *) return 0;;
             esac
+        elif [ "$?" = 3 ]; then
+            break
         elif [ "$rec_reason" != no-cellular-uplink ]; then
             return 0
         fi
